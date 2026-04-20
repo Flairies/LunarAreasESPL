@@ -127,10 +127,11 @@ const POWER_MOVE_DRAIN = 25;
 const POWER_MINE_DRAIN = 2.2;
 const PANEL_FLAT       = 7;
 const PANEL_RIDGE      = 22;
+const REACTOR_OUTPUT   = PANEL_RIDGE * 1.5;
 // Asset costs (budget credits) — base values before allocation modifiers
-const BASE_ASSET_COSTS  = { solar: 40, habitat: 90, rover: 60, pad: 150 };
-const ASSET_POINTS      = { solar: 2,  habitat: 10, rover: 3,  pad: 5  }; // infrastructure points per structure
-const BASE_MAINT_COSTS = { solar: 0,  habitat: 0,  rover: 0,  pad: 0   }; // deprecated — replaced by resupply
+const BASE_ASSET_COSTS  = { solar: 40, habitat: 90, rover: 60, pad: 150, reactor: 280 };
+const ASSET_POINTS      = { solar: 2,  habitat: 10, rover: 3,  pad: 5, reactor: 15 }; // infrastructure points per structure
+const BASE_MAINT_COSTS = { solar: 0,  habitat: 0,  rover: 0,  pad: 0, reactor: 0 }; // deprecated — replaced by resupply
 // Resupply: each step, if a player owns ≥1 functional landing pad, this much
 // total health is distributed across damaged assets, prioritizing the lowest
 // health first so that asset health stays balanced. Roughly offsets passive
@@ -151,6 +152,7 @@ const MAX_PANELS       = Infinity; // was 6
 const MAX_HABITATS     = Infinity; // was 3
 const MAX_ROVERS       = Infinity; // was 2
 const MAX_PADS         = Infinity; // was 1
+const MAX_REACTORS     = 1;
 const POWER_CAP        = 120;
 const HABITAT_POWER_CAP   = 80;   // max power per habitat
 const HABITAT_POWER_DRAIN = 2.0;  // power consumed per habitat per day
@@ -189,6 +191,7 @@ const PIXELS_PER_KM    = W / MAP_KM;      // ≈ 2.4248 px/km (W = 700 px)
 const SAFETY_RADIUS = {
   pad:     7.22  * PIXELS_PER_KM,   // ~17.5 px
   solar:   2.89  * PIXELS_PER_KM,   // ~7 px
+  reactor: 5.78  * PIXELS_PER_KM,   // ~14 px
   habitat: 14.43 * PIXELS_PER_KM,   // ~35 px
   rover:   1.44  * PIXELS_PER_KM,   // ~3.5 px
 };
@@ -226,16 +229,27 @@ function snapToPSR(x, y) {
 
 // Is it lunar night for non-ridge panels at this global day?
 const isNight = (globalDay) => (globalDay % NIGHT_CYCLE) >= 7;
+const hasPlacementGrace = (arrivalDay = 0, globalDay = 0) => globalDay < ((arrivalDay ?? 0) + DAYS_PER_ROUND);
+const getCraterIceCapacity = (crater, depletionRate = DEPLETION_RATE) => crater.size / (Math.max(1e-6, depletionRate) * CRATER_REFERENCE_SIZE);
+const getTotalMapIce = (po = {}) => {
+  const depRate = po.DEPLETION_RATE != null ? po.DEPLETION_RATE : DEPLETION_RATE;
+  return CRATER_DATA.reduce((sum, crater) => sum + getCraterIceCapacity(crater, depRate), 0);
+};
+const DEPLETION_END_THRESHOLD = 0.005;
 
 // ── Player factory ────────────────────────────────────────────────────────────
-function makePlayer(base, id, color) {
+function makePlayer(base, id, color, opts = {}) {
+  const active = opts.active ?? true;
   return {
     id, color,
+    active,
+    arrivalDay: opts.arrivalDay ?? 0,
     base: { ...base },
     x: base.x, y: base.y,
     power: POWER_CAP * 0.65,
     ice: 0, iceDeposited: 0,
     panels: [],
+    reactors: [],
     habitats: [],
     habitatPower: [],  // power level per habitat (index-matched); 0 = unpowered
     extraRovers: [],   // each: { x, y, waypoints, currentWaypoint, ice, carrying, status }
@@ -244,14 +258,15 @@ function makePlayer(base, id, color) {
     pendingDeliveries: [], // { id, type, padIdx } — waiting at a landing pad
     carrying: null,        // { id, type } — structure rover is transporting
     diplomacy: 0,          // national diplomacy score (-100 = Infamous, 100 = Amicable)
-    structureHealth: {     // health per structure type: { panels:[], habitats:[], extraRovers:[], landingPads:[] }
-      panels: [], habitats: [], extraRovers: [], landingPads: [],
+    generatorRangeEntries: {}, // per-generator arrival timestamps for charging tie breaks
+    structureHealth: {     // health per structure type: { panels:[], reactors:[], habitats:[], extraRovers:[], landingPads:[] }
+      panels: [], reactors: [], habitats: [], extraRovers: [], landingPads: [],
     },
     waypoints: [],          // queued waypoint list
     currentWaypoint: null,
     status: "idle",
     mineMap: {},            // px_idx → total kg mined there
-    assetPts: ASSET_POINTS.rover, // primary rover counts toward infrastructure total
+    assetPts: active ? ASSET_POINTS.rover : 0, // primary rover counts toward infrastructure total once player is active
     depositLog: [],         // per-round deposits for chart
     forecast: 0,            // projected end total
     // Economy
@@ -309,8 +324,153 @@ function calcMilScore(milStock) {
   return Math.max(0.1, milStock / 20);
 }
 
+function isPlayerActiveForDiplomacy(player, globalDay) {
+  return !!player && player.active !== false && globalDay >= (player.arrivalDay ?? 0);
+}
+
+function activatePlayer(player) {
+  if (!player || player.active) return player;
+  return {
+    ...player,
+    active: true,
+    assetPts: Math.max(player.assetPts ?? 0, ASSET_POINTS.rover),
+    status: "idle",
+  };
+}
+
+function getGeneratorOutput(generator, night) {
+  if (generator.kind === "solar" && night) return 0;
+  const px = Math.round(generator.y) * W + Math.round(generator.x);
+  const illum = (px >= 0 && px < W * H) ? ILLUM_MAP[px] : 1.0;
+  return generator.kind === "reactor" ? REACTOR_OUTPUT : PANEL_RIDGE * illum;
+}
+
+function allocateDailyPower(players, globalDay, sharedGrid=false) {
+  const night = isNight(globalDay);
+  const states = players.map((player, idx) => {
+    if (!player || player.active === false || globalDay < (player.arrivalDay ?? 0)) return null;
+    return {
+      playerId: idx + 1,
+      player: { ...player },
+      habitatPower: [...(player.habitatPower || (player.habitats || []).map(() => HABITAT_POWER_INIT))],
+      extraRovers: [...(player.extraRovers || [])],
+      structureHealth: {
+        panels:      [...(player.structureHealth?.panels      || (player.panels || []).map(() => 1.0))],
+        reactors:    [...(player.structureHealth?.reactors    || (player.reactors || []).map(() => 1.0))],
+        habitats:    [...(player.structureHealth?.habitats    || (player.habitats || []).map(() => 1.0))],
+        extraRovers: [...(player.structureHealth?.extraRovers || (player.extraRovers || []).map(() => 1.0))],
+        landingPads: [...(player.structureHealth?.landingPads || (player.landingPads || []).map(() => 1.0))],
+      },
+      generatorRangeEntries: { ...(player.generatorRangeEntries || {}) },
+    };
+  });
+
+  const allocateNetwork = (networkStates, networkTargets) => {
+    const generators = networkStates.flatMap(state => ([
+      ...(state.player.panels || []).map((panel, idx) => ({ ...panel, kind: "solar", idx, owner: state })),
+      ...(state.player.reactors || []).map((reactor, idx) => ({ ...reactor, kind: "reactor", idx, owner: state })),
+    ]));
+
+    for (const generator of generators) {
+      const healthKey = generator.kind === "reactor" ? "reactors" : "panels";
+      if ((generator.owner.structureHealth[healthKey]?.[generator.idx] ?? 1.0) <= 0) continue;
+
+      const output = getGeneratorOutput(generator, night);
+      if (output <= 0) continue;
+
+      const generatorId = `${generator.kind}-${generator.idx}`;
+      const previousEntries = { ...(generator.owner.generatorRangeEntries[generatorId] || {}) };
+      const currentEntries = {};
+      const candidates = [];
+
+      for (const target of networkTargets) {
+        if (target.destroyed) continue;
+        if (d2(generator, target) > SAFETY_RADIUS[generator.kind]) continue;
+
+        const firstSeen = previousEntries[target.id] ?? globalDay;
+        currentEntries[target.id] = firstSeen;
+
+        const currentPower = target.getPower();
+        if (currentPower >= target.capacity) continue;
+        candidates.push({ target, currentPower, firstSeen });
+      }
+
+      generator.owner.generatorRangeEntries[generatorId] = currentEntries;
+      if (!candidates.length) continue;
+
+      candidates.sort((a, b) =>
+        a.currentPower - b.currentPower
+        || a.firstSeen - b.firstSeen
+        || a.target.id.localeCompare(b.target.id)
+      );
+
+      const chosen = candidates[0];
+      chosen.target.setPower(Math.min(chosen.target.capacity, chosen.currentPower + output));
+    }
+  };
+
+  const buildTargets = (networkStates) => networkStates.flatMap(state => ([
+    {
+      id: `p${state.playerId}-rover-primary`,
+      x: state.player.x,
+      y: state.player.y,
+      capacity: POWER_CAP,
+      getPower: () => state.player.power ?? 0,
+      setPower: (value) => { state.player.power = value; },
+    },
+    ...state.extraRovers.map((rover, idx) => ({
+      id: `p${state.playerId}-rover-extra-${idx}`,
+      x: rover.x,
+      y: rover.y,
+      capacity: POWER_CAP,
+      getPower: () => state.extraRovers[idx].power ?? POWER_CAP,
+      setPower: (value) => { state.extraRovers[idx] = { ...state.extraRovers[idx], power: value }; },
+    })),
+    ...(state.player.habitats || []).map((habitat, idx) => ({
+      id: `p${state.playerId}-habitat-${idx}`,
+      x: habitat.x,
+      y: habitat.y,
+      capacity: HABITAT_POWER_CAP,
+      destroyed: (state.structureHealth.habitats[idx] ?? 1.0) <= 0,
+      getPower: () => state.habitatPower[idx] ?? HABITAT_POWER_INIT,
+      setPower: (value) => { state.habitatPower[idx] = value; },
+    })),
+  ]));
+
+  if (sharedGrid) {
+    const activeStates = states.filter(Boolean);
+    allocateNetwork(activeStates, buildTargets(activeStates));
+  } else {
+    states.forEach(state => {
+      if (!state) return;
+      allocateNetwork([state], buildTargets([state]));
+    });
+  }
+
+  states.forEach(state => {
+    if (!state) return;
+    for (let i = 0; i < (state.player.habitats || []).length; i++) {
+      if ((state.structureHealth.habitats[i] ?? 1.0) <= 0) continue;
+      state.habitatPower[i] = Math.max(0, Math.min(HABITAT_POWER_CAP, (state.habitatPower[i] ?? HABITAT_POWER_INIT) - HABITAT_POWER_DRAIN));
+    }
+  });
+
+  return states.map((state, idx) => {
+    if (!state) return players[idx];
+    return {
+      ...state.player,
+      habitatPower: state.habitatPower,
+      extraRovers: state.extraRovers,
+      generatorRangeEntries: state.generatorRangeEntries,
+    };
+  });
+}
+
 // ── Simulation step (one day) ─────────────────────────────────────────────────
 function simDay(s, craterHealth, globalDay, po={}) {
+  if (s?.active === false || globalDay < (s?.arrivalDay ?? 0)) {
+    return { ...s, status: "idle" };
+  }
   // Physics values: use override if provided, else fall back to module constant
   const _ROVER_STEP       = po.ROVER_STEP       != null ? po.ROVER_STEP       : ROVER_STEP;
   const _POWER_MOVE_DRAIN = po.POWER_MOVE_DRAIN != null ? po.POWER_MOVE_DRAIN : POWER_MOVE_DRAIN;
@@ -318,44 +478,47 @@ function simDay(s, craterHealth, globalDay, po={}) {
   const _BASE_MINE_RATE   = po.BASE_MINE_RATE   != null ? po.BASE_MINE_RATE   : BASE_MINE_RATE;
   const _DEPLETION_RATE   = po.DEPLETION_RATE   != null ? po.DEPLETION_RATE   : DEPLETION_RATE;
 
-  let { x, y, power, ice, base, panels, habitats, pendingDeliveries, carrying, waypoints, currentWaypoint, mineMap } = s;
+  let { x, y, power, ice, base, panels, reactors, habitats, pendingDeliveries, carrying, waypoints, currentWaypoint, mineMap } = s;
   let habitatPower = [...(s.habitatPower || (habitats||[]).map(() => HABITAT_POWER_INIT))];
   let structureHealth = {
     panels:      [...(s.structureHealth?.panels      || panels.map(() => 1.0))],
+    reactors:    [...(s.structureHealth?.reactors    || (reactors||[]).map(() => 1.0))],
     habitats:    [...(s.structureHealth?.habitats    || habitats.map(() => 1.0))],
     extraRovers: [...(s.structureHealth?.extraRovers || (s.extraRovers||[]).map(() => 1.0))],
     landingPads: [...(s.structureHealth?.landingPads || (s.landingPads||[]).map(() => 1.0))],
   };
   x = Math.round(x); y = Math.round(y);
   pendingDeliveries = [...(pendingDeliveries||[])];
+  reactors = [...(reactors||[])];
 
   const night = isNight(globalDay);
 
   // ── Per-panel power routing ──────────────────────────────────────────────
-  // Each panel routes its output based on proximity:
-  //   • Rover within SAFETY_RADIUS.solar  → prioritise rover; overflow to nearest in-zone habitat
-  //   • Panel within SAFETY_RADIUS.habitat of a habitat (and rover not nearby)
-  //                                        → goes to that habitat; overflow to rover
-  //   • Otherwise                          → rover pool
+  // Each generator routes its output strictly by proximity:
+  //   • Rover within generator radius → charge rover
+  //   • Habitat within habitat radius → charge nearest habitat
+  //   • Otherwise                     → no charge delivered this turn
   let roverChargePool = 0;
-  const habitatChargePool = habitatPower.map(() => 0); // per-habitat charge accumulated this step
+  const habitatChargePool = habitatPower.map(() => HABITAT_POWER_DRAIN); // cancel per-pass drain; daily charging/drain happens in allocateDailyPower
+  const generators = [];
 
-  for (let pi = 0; pi < panels.length; pi++) {
-    const panel = panels[pi];
-    if (night) continue; // panels do not charge during lunar night
+  for (const generator of generators) {
+    if (generator.kind === "solar" && night) continue; // panels do not charge during lunar night
     // Power is now entirely illumination-driven during the day.
-    const px = Math.round(panel.y) * W + Math.round(panel.x);
+    const px = Math.round(generator.y) * W + Math.round(generator.x);
     const illum = (px >= 0 && px < W * H) ? ILLUM_MAP[px] : 1.0;
-    const pwr = PANEL_RIDGE * illum;
+    const pwr = generator.kind === "reactor" ? REACTOR_OUTPUT : PANEL_RIDGE * illum;
     if (pwr <= 0) continue;
+    const healthKey = generator.kind === "reactor" ? "reactors" : "panels";
+    if ((structureHealth[healthKey]?.[generator.idx] ?? 1.0) <= 0) continue;
 
-    const roverNear = d2({ x, y }, panel) <= SAFETY_RADIUS.solar;
+    const roverNear = d2({ x, y }, generator) <= SAFETY_RADIUS[generator.kind];
 
     // Find which habitat(s) this panel is in range of (use closest one)
     let closestHabIdx = -1, closestHabDist = Infinity;
     for (let hi = 0; hi < (habitats||[]).length; hi++) {
       if ((structureHealth.habitats[hi] ?? 1.0) <= 0) continue;
-      const dist = d2(panel, habitats[hi]);
+      const dist = d2(generator, habitats[hi]);
       if (dist <= SAFETY_RADIUS.habitat && dist < closestHabDist) {
         closestHabDist = dist;
         closestHabIdx = hi;
@@ -369,22 +532,12 @@ function simDay(s, craterHealth, globalDay, po={}) {
       const roverDeficit = Math.max(0, POWER_CAP - (power + roverChargePool));
       const toRover = Math.min(pwr, roverDeficit);
       roverChargePool += toRover;
-      const leftover = pwr - toRover;
-      if (leftover > 0 && inHabitatZone) {
-        habitatChargePool[closestHabIdx] += leftover;
-      } else {
-        roverChargePool += leftover; // cap will clamp it later
-      }
     } else if (inHabitatZone) {
       // Habitat priority: fill habitat first, overflow to rover
       const habDeficit = Math.max(0, HABITAT_POWER_CAP - (habitatPower[closestHabIdx] + habitatChargePool[closestHabIdx]));
       const toHab = Math.min(pwr, habDeficit);
       habitatChargePool[closestHabIdx] += toHab;
-      const leftover = pwr - toHab;
-      if (leftover > 0) roverChargePool += leftover;
-    } else {
       // No proximity rules — goes to rover
-      roverChargePool += pwr;
     }
   }
 
@@ -464,6 +617,9 @@ function simDay(s, craterHealth, globalDay, po={}) {
         if (carrying.type === "solar") {
           panels = [...panels, { x, y, onRidge }];
           structureHealth.panels = [...structureHealth.panels, 1.0];
+        } else if (carrying.type === "reactor") {
+          reactors = [...reactors, { x, y }];
+          structureHealth.reactors = [...structureHealth.reactors, 1.0];
         } else if (carrying.type === "habitat") {
           habitats = [...(habitats||[]), { x, y }];
           structureHealth.habitats = [...structureHealth.habitats, 1.0];
@@ -508,16 +664,18 @@ function simDay(s, craterHealth, globalDay, po={}) {
   }
 
   power = Math.max(0, power);
-  return { ...s, x: Math.round(x), y: Math.round(y), power, ice, panels, habitats, habitatPower, pendingDeliveries, carrying, waypoints, currentWaypoint, mineMap, status, events, structureHealth };
+  return { ...s, x: Math.round(x), y: Math.round(y), power, ice, panels, reactors, habitats, habitatPower, pendingDeliveries, carrying, waypoints, currentWaypoint, mineMap, status, events, structureHealth };
 }
 
 // ── Claim map ─────────────────────────────────────────────────────────────────
 function computeClaims(p1, p2, r1, r2) {
   const c = new Int8Array(W * H);
+  const p1Active = p1?.active !== false;
+  const p2Active = p2?.active !== false;
   for (let i = 0; i < W * H; i++) { if (!PSR_MASK[i]) continue;
     const px = i % W, py = (i / W) | 0;
-    const d1 = Math.sqrt((px - p1.x) ** 2 + (py - p1.y) ** 2);
-    const d2_ = Math.sqrt((px - p2.x) ** 2 + (py - p2.y) ** 2);
+    const d1 = p1Active ? Math.sqrt((px - p1.x) ** 2 + (py - p1.y) ** 2) : Infinity;
+    const d2_ = p2Active ? Math.sqrt((px - p2.x) ** 2 + (py - p2.y) ** 2) : Infinity;
     const in1 = d1 <= r1, in2 = d2_ <= r2;
     if (in1 && in2) c[i] = d1 < d2_ ? 1 : 2;
     else if (in1) c[i] = 1;
@@ -527,7 +685,7 @@ function computeClaims(p1, p2, r1, r2) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-const PHASE = { SETTINGS:"settings", SETUP1:"s1", SETUP1_HAB:"s1h", SETUP1_SOL:"s1s", SETUP1_PAD:"s1p", SETUP2:"s2", SETUP2_HAB:"s2h", SETUP2_SOL:"s2s", SETUP2_PAD:"s2p", PLAYING:"play", DONE:"done" };
+const PHASE = { SETTINGS:"settings", BATCH:"batch", SETUP1:"s1", SETUP1_HAB:"s1h", SETUP1_SOL:"s1s", SETUP1_PAD:"s1p", SETUP2:"s2", SETUP2_HAB:"s2h", SETUP2_SOL:"s2s", SETUP2_PAD:"s2p", PLAYING:"play", DONE:"done" };
 const STATUS_INFO = {
   moving:    { icon:"🚗", label:"Moving",    col:"#ffd040" },
   mining:    { icon:"⛏",  label:"Mining",    col:"#40e0ff" },
@@ -549,6 +707,11 @@ export default function App() {
 
   // Settings
   const [totalRounds, setTotalRounds] = useState(12);
+  const [missionEndMode, setMissionEndMode] = useState("fixed");
+  const [scenarioPreset, setScenarioPreset] = useState("standard");
+  const [arrivalDelay, setArrivalDelay] = useState(5);
+  const [gridSharingEnabled, setGridSharingEnabled] = useState(true);
+  const [gridSharingPermanent, setGridSharingPermanent] = useState(false);
 
   // ── Tool-mode features ────────────────────────────────────────────────────
   const [simMode, setSimMode]         = useState("competitive"); // "competitive" | "solo" | "analysis"
@@ -588,13 +751,24 @@ export default function App() {
   const [p2Done, setP2Done]           = useState(false); // P2 confirmed their action this step
   const [selectingFor, setSelectingFor] = useState(null); // null | 0 | 1
   const [placingFor, setPlacingFor]   = useState(null); // null | 0 | 1 — turn-1 manual placement
-  const [placingType, setPlacingType] = useState(null); // 'solar' | 'habitat' | 'pad'
+  const [placingType, setPlacingType] = useState(null); // 'solar' | 'reactor' | 'habitat' | 'pad'
   const [selectedRover, setSelectedRover] = useState([0, 0]); // per-player: 0=primary, 1+=extra rover index
   const [addingWaypoint, setAddingWaypoint] = useState(false);
   const [lastEvents, setLastEvents]     = useState([]);   // events from last step for toast display
   const [selectedBuild, setSelectedBuild] = useState([null, null]); // per-player selected build type
+  const [selectedDiplomacy, setSelectedDiplomacy] = useState([null, null]); // per-player selected diplomacy action
   const [selectedPad, setSelectedPad]     = useState([0, 0]);       // per-player selected landing pad index
   const [mapLayer, setMapLayer]           = useState("base");        // active map overlay
+  const [powerGridState, setPowerGridState] = useState({ mode:"independent", offeredBy:null, offeredTo:null });
+  const [batchRunCount, setBatchRunCount] = useState(100);
+  const [batchRunning, setBatchRunning] = useState(false);
+  const [batchProgress, setBatchProgress] = useState({ completed:0, total:100, currentSeed:null });
+  const [batchResult, setBatchResult] = useState(null);
+  const [replayRun, setReplayRun] = useState(null);
+  const [replayFrameIndex, setReplayFrameIndex] = useState(0);
+  const [replayPlaying, setReplayPlaying] = useState(false);
+  const [replayLoading, setReplayLoading] = useState(false);
+  const [undoStack, setUndoStack] = useState([]);
 
   useEffect(() => {
     const img = new window.Image();
@@ -636,6 +810,14 @@ export default function App() {
     return () => clearTimeout(timer);
   }, [simMode, p1Done, p2Done, phase]);
 
+  useEffect(() => {
+    if (scenarioPreset !== "unevenArrival" || phase !== PHASE.PLAYING || p2 || globalDay < arrivalDelay) return;
+    setPhase(PHASE.SETUP2);
+    setP1Done(false);
+    setP2Done(false);
+    setActiveTurn(1);
+  }, [scenarioPreset, phase, p2, globalDay, arrivalDelay]);
+
   // ── Mission log: append structured log entries on each day resolution ────
   useEffect(() => {
     if (phase !== PHASE.PLAYING || lastEvents.length === 0) return;
@@ -645,9 +827,28 @@ export default function App() {
       type: ev.type,
       kg: ev.kg,
       craterIdx: ev.craterIdx,
+      itemType: ev.itemType,
+      x: ev.x,
+      y: ev.y,
+      label:
+        ev.type === "mine" ? `Ice mined: ${Number(ev.kg || 0).toFixed(1)} kg from crater ${ev.craterIdx ?? "?"}` :
+        ev.type === "deposit" ? `Ice deposited: ${Number(ev.kg || 0).toFixed(1)} kg scored at a powered habitat` :
+        ev.type === "pickup" ? `${structureLabel(ev.itemType)} picked up from a landing pad` :
+        ev.type === "place" ? `${structureLabel(ev.itemType)} placed at (${Math.round(ev.x ?? 0)}, ${Math.round(ev.y ?? 0)})` :
+        undefined,
     }));
     setMissionLog(prev => [...prev, ...entries]);
   }, [lastEvents]);
+
+  useEffect(() => {
+    if (!replayRun || !replayPlaying) return;
+    if (replayFrameIndex >= (replayRun.frames?.length ?? 1) - 1) {
+      setReplayPlaying(false);
+      return;
+    }
+    const timer = setTimeout(() => loadReplayFrame(replayRun, replayFrameIndex + 1), 420);
+    return () => clearTimeout(timer);
+  }, [replayRun, replayPlaying, replayFrameIndex]);
 
   // ── Canvas rendering ─────────────────────────────────────────────────────
   const draw = useCallback(() => {
@@ -685,7 +886,7 @@ export default function App() {
 
     if (showLayers.mine) {
       for (const p of [p1, p2]) {
-        if (!p) continue;
+        if (!p || p.active === false) continue;
         const col = p.id === 1 ? [255,195,0] : [155,0,255];
         const entries = Object.entries(p.mineMap);
         if (!entries.length) continue;
@@ -747,10 +948,11 @@ export default function App() {
 
     // Safety zone circles (drawn first, behind everything)
     for (const p of [p1, p2]) {
-      if (!p) continue;
+      if (!p || p.active === false) continue;
       const sh = p.structureHealth || {};
       const structList = [
         { list: p.panels||[],       type:'solar',   key:'panels' },
+        { list: p.reactors||[],     type:'reactor', key:'reactors' },
         { list: p.habitats||[],     type:'habitat', key:'habitats' },
         { list: p.extraRovers||[], type:'rover',   key:'extraRovers' },
         { list: p.landingPads||[], type:'pad',     key:'landingPads' },
@@ -773,7 +975,7 @@ export default function App() {
     // Solar panels
     // Draw faint lines from panels that are in a habitat's safety zone to that habitat
     for (const p of [p1, p2]) {
-      if (!p) continue;
+      if (!p || p.active === false) continue;
       p.panels.forEach((pn) => {
         let closestHab = null, closestDist = Infinity;
         for (const h of (p.habitats||[])) {
@@ -795,7 +997,7 @@ export default function App() {
     }
 
     for (const p of [p1, p2]) {
-      if (!p) continue;
+      if (!p || p.active === false) continue;
       p.panels.forEach((pn, idx) => {
         const health = p.structureHealth?.panels?.[idx] ?? 1.0;
         const active = !night && (ILLUM_MAP[pn.y * W + pn.x] || 0) > 0.05;
@@ -817,9 +1019,29 @@ export default function App() {
       });
     }
 
+    for (const p of [p1, p2]) {
+      if (!p || p.active === false) continue;
+      (p.reactors||[]).forEach((rx, idx) => {
+        const health = p.structureHealth?.reactors?.[idx] ?? 1.0;
+        const destroyed = health <= 0;
+        ctx.save(); ctx.translate(rx.x, rx.y);
+        ctx.beginPath(); ctx.arc(0, 0, 8, 0, Math.PI*2);
+        ctx.fillStyle = destroyed ? "#333333cc" : p.color + "cc";
+        ctx.fill();
+        ctx.strokeStyle = destroyed ? "#555" : "#000";
+        ctx.lineWidth = 1.2;
+        ctx.stroke();
+        ctx.fillStyle = destroyed ? "#888" : "#000";
+        ctx.font = "bold 10px monospace"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+        ctx.fillText("☢", 0, 0);
+        if (health < 0.99) drawHealthBar(ctx, health, 18);
+        ctx.restore();
+      });
+    }
+
     // Habitats
     for (const p of [p1, p2]) {
-      if (!p) continue;
+      if (!p || p.active === false) continue;
       (p.habitats||[]).forEach((h, idx) => {
         const health = p.structureHealth?.habitats?.[idx] ?? 1.0;
         const hPwr   = (p.habitatPower ?? [])[idx] ?? HABITAT_POWER_INIT;
@@ -849,7 +1071,7 @@ export default function App() {
 
     // Extra rovers
     for (const p of [p1, p2]) {
-      if (!p) continue;
+      if (!p || p.active === false) continue;
       (p.extraRovers||[]).forEach((r, idx) => {
         const health = p.structureHealth?.extraRovers?.[idx] ?? 1.0;
         const erSi = STATUS_INFO[r.status] || STATUS_INFO.idle;
@@ -870,7 +1092,7 @@ export default function App() {
         }
         // Carrying bubble
         if (r.carrying) {
-          const icons = { solar:"☀", habitat:"🏠", rover:"🚗", pad:"🛬" };
+          const icons = { solar:"☀", reactor:"☢", habitat:"🏠", rover:"🚗", pad:"🛬" };
           ctx.fillStyle="rgba(3,8,20,0.85)"; ctx.fillRect(-18,-30,36,12);
           ctx.fillStyle="#ffaa44"; ctx.font="7px monospace"; ctx.textAlign="center"; ctx.textBaseline="middle";
           ctx.fillText((icons[r.carrying.type]||"?")+" CARGO", 0, -24);
@@ -882,7 +1104,7 @@ export default function App() {
 
     // Landing pads — with pending delivery badges and health bar
     for (const p of [p1, p2]) {
-      if (!p) continue;
+      if (!p || p.active === false) continue;
       (p.landingPads||[]).forEach((lp, lpIdx) => {
         const health = p.structureHealth?.landingPads?.[lpIdx] ?? 1.0;
         const destroyed = health <= 0;
@@ -900,7 +1122,7 @@ export default function App() {
         } else {
           const pending = (p.pendingDeliveries||[]).filter(d => d.padIdx === lpIdx);
           if (pending.length > 0) {
-            const icons = { solar:"*", habitat:"H", rover:"R", pad:"P" };
+            const icons = { solar:"*", reactor:"☢", habitat:"H", rover:"R", pad:"P" };
             ctx.font = "8px monospace"; ctx.textAlign = "center"; ctx.textBaseline = "bottom";
             pending.forEach((d, i) => {
               ctx.fillStyle = "rgba(3,8,18,0.85)";
@@ -920,7 +1142,7 @@ export default function App() {
 
     for (let pi2 = 0; pi2 < 2; pi2++) {
       const p = pi2 === 0 ? p1 : p2;
-      if (!p) continue;
+      if (!p || p.active === false) continue;
 
       // Primary rover waypoints
       const wps = [p.currentWaypoint, ...(p.waypoints||[])].filter(Boolean);
@@ -996,7 +1218,7 @@ export default function App() {
 
     // Rovers
     for (const p of [p1, p2]) {
-      if (!p) continue;
+      if (!p || p.active === false) continue;
       const si = STATUS_INFO[p.status] || STATUS_INFO.idle;
 
       // Turn indicator ring
@@ -1030,7 +1252,7 @@ export default function App() {
 
       // Carrying badge
       if (p.carrying) {
-        const icons = { solar:"☀", habitat:"🏠", rover:"🚗", pad:"🛬" };
+        const icons = { solar:"☀", reactor:"☢", habitat:"🏠", rover:"🚗", pad:"🛬" };
         ctx.fillStyle="rgba(255,170,40,0.92)"; ctx.fillRect(p.x-14,p.y-32,28,11);
         ctx.fillStyle="#000"; ctx.font="bold 7px monospace"; ctx.textAlign="center"; ctx.textBaseline="top";
         ctx.fillText((icons[p.carrying.type]||"?")+" CARGO", p.x, p.y-31);
@@ -1089,7 +1311,7 @@ export default function App() {
 
     // "DONE" checkmark on rover who finished their turn
     for (const p of [p1, p2]) {
-      if (!p) continue;
+      if (!p || p.active === false) continue;
       const isDone = (p.id===1&&p1Done)||(p.id===2&&p2Done);
       if (isDone && phase===PHASE.PLAYING) {
         ctx.fillStyle="#44ff66"; ctx.font="bold 11px monospace";
@@ -1146,6 +1368,7 @@ export default function App() {
   };
 
   const handleClick = e => {
+    if (replayRun) return;
     const { x, y } = getXY(e);
     if (x<0||x>=W||y<0||y>=H) return;
 
@@ -1159,9 +1382,16 @@ export default function App() {
     }
 
     if (phase===PHASE.SETUP1) {
+      recordUndoCheckpoint();
       const s = snapToPSR(x,y);
       setP1(makePlayer(s,1,"#ffdc00"));
-      setPhase(PHASE.SETUP2);
+      appendMissionLog({ type:"setup", actor:1, label:`P1 placed base at (${s.x}, ${s.y})` });
+      if (scenarioPreset === "unevenArrival") {
+        setPhase(PHASE.PLAYING);
+        setActiveTurn(0); setP1Done(false); setP2Done(false);
+      } else {
+        setPhase(PHASE.SETUP2);
+      }
     } else if (phase===PHASE.SETUP1_HAB) {
       // legacy — unreachable
       setPhase(PHASE.SETUP1_SOL);
@@ -1170,8 +1400,12 @@ export default function App() {
     } else if (phase===PHASE.SETUP1_PAD) {
       setPhase(PHASE.SETUP2);
     } else if (phase===PHASE.SETUP2) {
+      recordUndoCheckpoint();
       const s = snapToPSR(x,y);
-      setP2(makePlayer(s,2,"#b000ff"));
+      setP2(makePlayer(s,2,"#b000ff", {
+        arrivalDay: scenarioPreset === "unevenArrival" ? globalDay : 0,
+      }));
+      appendMissionLog({ type:"setup", actor:2, label:`P2 placed base at (${s.x}, ${s.y})` });
       setPhase(PHASE.PLAYING);
       setActiveTurn(0); setP1Done(false); setP2Done(false);
     } else if (phase===PHASE.SETUP2_HAB) {
@@ -1182,6 +1416,7 @@ export default function App() {
       setPhase(PHASE.PLAYING);
       setActiveTurn(0); setP1Done(false); setP2Done(false);
     } else if (placingFor !== null && placingType) {
+      recordUndoCheckpoint();
       const pi = placingFor;
       const setFn = pi===0 ? setP1 : setP2;
       const type = placingType;
@@ -1198,6 +1433,10 @@ export default function App() {
           return { ...p, budget: (p.budget??0)-cost, assetPts: (p.assetPts??0)+pts,
                    panels: [...p.panels, { x, y, onRidge }],
                    structureHealth: { ...sh, panels: [...(sh.panels||[]), 1.0] } };
+        } else if (type === "reactor") {
+          return { ...p, budget: (p.budget??0)-cost, assetPts: (p.assetPts??0)+pts,
+                   reactors: [...(p.reactors||[]), at],
+                   structureHealth: { ...sh, reactors: [...(sh.reactors||[]), 1.0] } };
         } else if (type === "habitat") {
           return { ...p, budget: (p.budget??0)-cost, assetPts: (p.assetPts??0)+pts,
                    habitats: [...(p.habitats||[]), at],
@@ -1210,10 +1449,17 @@ export default function App() {
         }
         return p;
       });
-      landingImpact(pi, x, y);
+      if (type === "reactor") {
+        const enemyP = pi === 0 ? p2 : p1;
+        setFn(prev => applyReactorPlacementPenalty(prev, enemyP, x, y));
+      } else {
+        landingImpact(pi, x, y);
+      }
+      appendMissionLog({ type:"placement", actor:pi + 1, itemType:type, label:`P${pi+1} placed ${structureLabel(type)} at (${x}, ${y})` });
       setPlacingFor(null);
       setPlacingType(null);
     } else if (selectingFor !== null) {
+      recordUndoCheckpoint();
       const wp = { x, y };
       const rIdx = selectedRover[selectingFor];
       const setFn = selectingFor===0 ? setP1 : setP2;
@@ -1231,14 +1477,22 @@ export default function App() {
           return { ...p, extraRovers: newER };
         }
       });
+      appendMissionLog({
+        type:"waypoint",
+        actor: selectingFor + 1,
+        rover: rIdx + 1,
+        label:`P${selectingFor+1} set ${addingWaypoint ? "an additional" : "a"} waypoint for R${rIdx + 1} to (${x}, ${y})`,
+      });
       if (!addingWaypoint) setSelectingFor(null);
     }
   };
 
   const handleRightClick = e => {
+    if (replayRun) return;
     e.preventDefault();
     const { x, y } = getXY(e);
     if (selectingFor !== null) {
+      recordUndoCheckpoint();
       const wp = { x, y };
       const rIdx2 = selectedRover[selectingFor];
       const setFn2 = selectingFor===0 ? setP1 : setP2;
@@ -1250,6 +1504,12 @@ export default function App() {
         if (!newER2[erIdx2]) return p;
         newER2[erIdx2] = { ...newER2[erIdx2], waypoints:[...(newER2[erIdx2].waypoints||[]),wp] };
         return { ...p, extraRovers: newER2 };
+      });
+      appendMissionLog({
+        type:"waypoint",
+        actor: selectingFor + 1,
+        rover: rIdx2 + 1,
+        label:`P${selectingFor+1} queued an additional waypoint for R${rIdx2 + 1} to (${x}, ${y})`,
       });
     }
   };
@@ -1295,6 +1555,7 @@ export default function App() {
         power: erResult.power,         // write the drained value back
         // carry forward panels/habitats/pads placed by this rover
         _panels: erResult.panels,
+        _reactors: erResult.reactors,
         _habitats: erResult.habitats,
         _habitatPower: erResult.habitatPower,
         _landingPads: erResult.landingPads,
@@ -1318,6 +1579,10 @@ export default function App() {
         mergedResult = { ...mergedResult, panels: er._panels,
           structureHealth: { ...mergedResult.structureHealth, panels: er._structureHealth.panels } };
       }
+      if (er._reactors && er._reactors.length > (mergedResult.reactors||[]).length) {
+        mergedResult = { ...mergedResult, reactors: er._reactors,
+          structureHealth: { ...mergedResult.structureHealth, reactors: er._structureHealth.reactors } };
+      }
       if (er._habitats && er._habitats.length > mergedResult.habitats.length) {
         mergedResult = { ...mergedResult, habitats: er._habitats,
           habitatPower: er._habitatPower,
@@ -1330,7 +1595,7 @@ export default function App() {
     }
 
     // Strip internal merge fields from extraRovers
-    const cleanExtraRovers = newExtraRovers.map(({ _panels, _habitats, _habitatPower, _landingPads, _structureHealth, events: _ev, ...clean }) => clean);
+    const cleanExtraRovers = newExtraRovers.map(({ _panels, _reactors, _habitats, _habitatPower, _landingPads, _structureHealth, events: _ev, ...clean }) => clean);
 
     const finalResult = { ...mergedResult, extraRovers: cleanExtraRovers, events: allEvents };
     return [{ ...finalResult, iceDeposited: s.iceDeposited + totalDep }, newHealth, allEvents];
@@ -1338,29 +1603,43 @@ export default function App() {
 
   // ── End Turn for the active player ───────────────────────────────────────
   const endTurn = (pi) => {
+    if (replayRun) return;
     if (phase !== PHASE.PLAYING) return;
+    const p2Present = !!p2;
     // pi is 0-indexed player index
     if (pi===0 && !p1Done) {
+      recordUndoCheckpoint();
       setP1Done(true);
-      if (!p2Done) { setActiveTurn(1); } // P2 still needs to go
-    } else if (pi===1 && !p2Done) {
+      appendMissionLog({ type:"turn", actor:1, label:"P1 committed its plan and ended turn" });
+      if (p2Present && !p2Done) { setActiveTurn(1); } // P2 still needs to go
+    } else if (pi===1 && p2Present && !p2Done) {
+      recordUndoCheckpoint();
       setP2Done(true);
+      appendMissionLog({ type:"turn", actor:2, label:"P2 committed its plan and ended turn" });
       if (!p1Done) { setActiveTurn(0); } // P1 still needs to go
     }
   };
 
   // When both players are done, resolve the day
   useEffect(() => {
-    if (!p1Done || !p2Done || !p1 || !p2 || phase!==PHASE.PLAYING) return;
+    if (!p1Done || !p1 || phase!==PHASE.PLAYING) return;
+    if (p2 && !p2Done) return;
 
     // Both players committed — simulate the day simultaneously
     // Use the same starting craterHealth for both, then merge depletions
+    const sharedGridActive = powerGridState.mode === "shared";
+    const [chargedP1, chargedP2] = allocateDailyPower([p1, p2], globalDay, sharedGridActive);
     const ch = new Float32Array(craterHealth);
-    const [np1, _ch2, evs1] = stepPlayer(p1, ch, globalDay);
-    const [np2, ch3, evs2] = stepPlayer(p2, ch, globalDay);
-    // ch3 reflects p2's mining; _ch2 reflects p1's mining. Merge by taking min of both depletions.
-    for (let i = 0; i < ch3.length; i++) {
-      ch3[i] = Math.min(_ch2[i], ch3[i]);
+    const [np1, _ch2, evs1] = stepPlayer(chargedP1, ch, globalDay);
+    let np2 = p2;
+    let ch3 = _ch2;
+    let evs2 = [];
+    if (p2) {
+      [np2, ch3, evs2] = stepPlayer(chargedP2, ch, globalDay);
+      // ch3 reflects p2's mining; _ch2 reflects p1's mining. Merge by taking min of both depletions.
+      for (let i = 0; i < ch3.length; i++) {
+        ch3[i] = Math.min(_ch2[i], ch3[i]);
+      }
     }
 
     // ── Safety zone decay ──────────────────────────────────────────────────
@@ -1368,6 +1647,7 @@ export default function App() {
       const sh = { ...owner.structureHealth };
       const structTypes = [
         { key: 'panels',      list: owner.panels,             type: 'solar'   },
+        { key: 'reactors',    list: owner.reactors||[],       type: 'reactor' },
         { key: 'habitats',    list: owner.habitats||[],       type: 'habitat' },
         { key: 'extraRovers', list: owner.extraRovers||[],   type: 'rover'   },
         { key: 'landingPads', list: owner.landingPads||[],   type: 'pad'     },
@@ -1383,7 +1663,8 @@ export default function App() {
         for (let idx = 0; idx < list.length; idx++) {
           const struct = list[idx];
           const radius = SAFETY_RADIUS[type];
-          const inZone = d2(enemyPos, struct) < radius;
+          const generatorSharedSafe = sharedGridActive && (type === "solar" || type === "reactor");
+          const inZone = !generatorSharedSafe && d2(enemyPos, struct) < radius;
           const decay = inZone ? hostileDecayEff : _PASSIVE_DECAY;
           if (inZone) damageDone += hostileDecayEff;
           healths[idx] = Math.max(0, (healths[idx] ?? 1.0) - decay);
@@ -1394,21 +1675,34 @@ export default function App() {
     };
 
     const mil1 = np1.milScore ?? 1.0;
-    const mil2 = np2.milScore ?? 1.0;
-    const { updatedOwner: dnp1, damageDone: dmgByP2 } = applyDecay(np1, { x: np2.x, y: np2.y }, mil2, mil1);
-    const { updatedOwner: dnp2, damageDone: dmgByP1 } = applyDecay(np2, { x: np1.x, y: np1.y }, mil1, mil2);
+    const mil2 = np2?.milScore ?? 1.0;
+    const { updatedOwner: dnp1, damageDone: dmgByP2 } = p2
+      ? applyDecay(np1, { x: np2.x, y: np2.y }, mil2, mil1)
+      : { updatedOwner: np1, damageDone: 0 };
+    const { updatedOwner: dnp2, damageDone: dmgByP1 } = p2
+      ? applyDecay(np2, { x: np1.x, y: np1.y }, mil1, mil2)
+      : { updatedOwner: np2, damageDone: 0 };
     const fnp1base = dnp1;
     const fnp2base = dnp2;
 
     // ── Diplomacy updates ──────────────────────────────────────────────────
     const DIPLOMACY_PASSIVE_GAIN = 0.5;   // per turn, natural recovery
     const DIPLOMACY_DAMAGE_PENALTY = 80;  // 4× — every harmful act has real diplomatic weight
-    const fnp1 = { ...fnp1base, diplomacy: Math.min(100, Math.max(-100,
-      (fnp1base.diplomacy ?? 0) + DIPLOMACY_PASSIVE_GAIN - dmgByP1 * DIPLOMACY_DAMAGE_PENALTY
+    const diplomacyRecoveryEnabled = isPlayerActiveForDiplomacy(fnp1base, globalDay) && isPlayerActiveForDiplomacy(fnp2base, globalDay);
+    const passiveGain = diplomacyRecoveryEnabled ? DIPLOMACY_PASSIVE_GAIN : 0;
+    let fnp1 = { ...fnp1base, diplomacy: Math.min(100, Math.max(-100,
+      (fnp1base.diplomacy ?? 0) + passiveGain - dmgByP1 * DIPLOMACY_DAMAGE_PENALTY
     )) };
-    const fnp2 = { ...fnp2base, diplomacy: Math.min(100, Math.max(-100,
-      (fnp2base.diplomacy ?? 0) + DIPLOMACY_PASSIVE_GAIN - dmgByP2 * DIPLOMACY_DAMAGE_PENALTY
-    )) };
+    let fnp2 = fnp2base ? { ...fnp2base, diplomacy: Math.min(100, Math.max(-100,
+      (fnp2base.diplomacy ?? 0) + passiveGain - dmgByP2 * DIPLOMACY_DAMAGE_PENALTY
+    )) } : null;
+
+    if (p2) {
+      const p1ReactorPlacements = evs1.filter(ev => ev.type === "place" && ev.itemType === "reactor");
+      const p2ReactorPlacements = evs2.filter(ev => ev.type === "place" && ev.itemType === "reactor");
+      for (const ev of p1ReactorPlacements) fnp1 = applyReactorPlacementPenalty(fnp1, fnp2, ev.x, ev.y);
+      for (const ev of p2ReactorPlacements) fnp2 = applyReactorPlacementPenalty(fnp2, fnp1, ev.x, ev.y);
+    }
 
     const newGlobalDay = globalDay + 1;
     const newDay = day + 1;
@@ -1423,21 +1717,23 @@ export default function App() {
       const dep1 = evs1.filter(e=>e.type==="deposit").reduce((s,e)=>s+e.kg,0);
       const dep2 = evs2.filter(e=>e.type==="deposit").reduce((s,e)=>s+e.kg,0);
       newCR[0] = Math.min(220, newCR[0] + Math.min(18, dep1/18));
-      newCR[1] = Math.min(220, newCR[1] + Math.min(18, dep2/18));
+      if (p2) newCR[1] = Math.min(220, newCR[1] + Math.min(18, dep2/18));
       // ── Economy: process round budget (new model) ─────────────────────────
       // Compute cross-player maximums for contentness C
-      const E1 = fnp1.econ ?? E_INIT, E2 = fnp2.econ ?? E_INIT;
-      const T1 = fnp1.assetPts ?? 0,  T2 = fnp2.assetPts ?? 0;  // T = asset points
-      const M1 = fnp1.milStock ?? 1,  M2 = fnp2.milStock ?? 1;
+      const E1 = fnp1.econ ?? E_INIT, E2 = fnp2?.econ ?? E_INIT;
+      const T1 = fnp1.assetPts ?? 0,  T2 = fnp2?.assetPts ?? 0;  // T = asset points
+      const M1 = fnp1.milStock ?? 1,  M2 = fnp2?.milStock ?? 1;
       const E_max = Math.max(E1, E2), T_max = Math.max(T1, T2), M_max = Math.max(M1, M2);
 
       const processEconomy = (p, E, T, M) => {
+        if (p.active === false) return p;
         const alloc = p.alloc || { mil: 20, rd: 20, econ: 60 };
         const budget = calcBudget(E);
 
         // I_A = asset maintenance this round (new purchase costs are deducted on buy)
         const { maint } = calcAssetCosts(alloc);
         const I_A = (p.panels.length           * maint.solar)
+                  + (((p.reactors||[]).length) * maint.reactor)
                   + ((p.habitats||[]).length    * maint.habitat)
                   + ((p.extraRovers||[]).length * maint.rover)
                   + ((p.landingPads||[]).length * maint.pad);
@@ -1466,16 +1762,16 @@ export default function App() {
                  budget: newBudget };
       };
       efnp1 = processEconomy(fnp1, E1, T1, M1);
-      efnp2 = processEconomy(fnp2, E2, T2, M2);
+      efnp2 = p2 ? processEconomy(fnp2, E2, T2, M2) : null;
 
       setHistory(h => [...h, {
         r: round,
         d1: Math.round(efnp1.iceDeposited),
-        d2: Math.round(efnp2.iceDeposited),
+        d2: Math.round(efnp2?.iceDeposited ?? 0),
         dep1: Math.round(dep1),
         dep2: Math.round(dep2),
         bud1: Math.round(efnp1.budget),
-        bud2: Math.round(efnp2.budget),
+        bud2: Math.round(efnp2?.budget ?? 0),
       }]);
       newRound = round + 1;
       roundEnded = true;
@@ -1483,24 +1779,30 @@ export default function App() {
 
     setGlobalDay(newGlobalDay);
     setP1(roundEnded ? efnp1 : fnp1);
-    setP2(roundEnded ? efnp2 : fnp2);
+    setP2(p2 ? (roundEnded ? efnp2 : fnp2) : null);
     setCraterHealth(ch3); setClaimR(newCR);
 
+    const missionEndsOnDepletion = missionEndMode === "depletion" && isMapDepleted(ch3);
     if (roundEnded) {
-      if (newRound > totalRounds) {
+      if ((missionEndMode === "fixed" && newRound > totalRounds) || missionEndsOnDepletion) {
         setPhase(PHASE.DONE);
         setP1Done(false); setP2Done(false);
         return;
       }
       setRound(newRound); setDay(0);
     } else {
+      if (missionEndsOnDepletion) {
+        setPhase(PHASE.DONE);
+        setP1Done(false); setP2Done(false);
+        return;
+      }
       setDay(newDay);
     }
 
     // Reset for next day — P1 goes first
     setP1Done(false); setP2Done(false);
     setActiveTurn(0);
-  }, [p1Done, p2Done]);
+  }, [p1Done, p2Done, phase, p1, p2, craterHealth, globalDay, round, day, totalRounds, powerGridState, missionEndMode]);
 
   // ── UI helpers ───────────────────────────────────────────────────────────
   // Apply landing damage to every enemy structure whose safety zone contains
@@ -1509,6 +1811,7 @@ export default function App() {
   // matching the per-unit-damage penalty rate used by passive rover decay
   // (20 diplomacy per unit of HP destroyed).
   const LANDING_DIPLOMACY_PENALTY = 80;
+  const REACTOR_DIPLOMACY_PENALTY = 12;
   const landingImpact = (pi, lx, ly) => {
     const enemyPi = pi === 0 ? 1 : 0;
     const enemyP = enemyPi === 0 ? p1 : p2;
@@ -1518,11 +1821,12 @@ export default function App() {
     const eSh = { ...(enemyP.structureHealth || {}) };
     const eLists = {
       panels:      enemyP.panels        || [],
+      reactors:    enemyP.reactors      || [],
       habitats:    enemyP.habitats      || [],
       extraRovers: enemyP.extraRovers   || [],
       landingPads: enemyP.landingPads   || [],
     };
-    const typeFor = { panels:'solar', habitats:'habitat', extraRovers:'rover', landingPads:'pad' };
+    const typeFor = { panels:'solar', reactors:'reactor', habitats:'habitat', extraRovers:'rover', landingPads:'pad' };
     let totalDamage = 0;
     for (const k of Object.keys(eLists)) {
       const arr = [...(eSh[k] || eLists[k].map(()=>1.0))];
@@ -1547,7 +1851,111 @@ export default function App() {
     }
   };
 
+  const countNearbyEnemyStructures = (enemyP, x, y, radius = SAFETY_RADIUS.reactor) => {
+    if (!enemyP) return 0;
+    const eLists = [
+      { list: enemyP.panels || [], key: "panels" },
+      { list: enemyP.reactors || [], key: "reactors" },
+      { list: enemyP.habitats || [], key: "habitats" },
+      { list: enemyP.extraRovers || [], key: "extraRovers" },
+      { list: enemyP.landingPads || [], key: "landingPads" },
+    ];
+    let count = 0;
+    for (const { list, key } of eLists) {
+      const healths = enemyP.structureHealth?.[key] || list.map(() => 1.0);
+      for (let i = 0; i < list.length; i++) {
+        if ((healths[i] ?? 1.0) <= 0) continue;
+        if (d2({ x, y }, list[i]) < radius) count++;
+      }
+    }
+    return count;
+  };
+
+  const applyReactorPlacementPenalty = (playerState, enemyState, x, y) => {
+    const nearby = countNearbyEnemyStructures(enemyState, x, y);
+    if (nearby <= 0 || !playerState) return playerState;
+    return {
+      ...playerState,
+      diplomacy: Math.max(-100, Math.min(100, (playerState.diplomacy ?? 0) - nearby * REACTOR_DIPLOMACY_PENALTY)),
+    };
+  };
+
+  const appendMissionLog = (entry) => {
+    setMissionLog(prev => [...prev, { round, day, globalDay, ...entry }]);
+  };
+
+  const structureLabel = (type) => ({
+    solar: "Solar Panel",
+    reactor: "Nuclear Reactor",
+    habitat: "Habitat",
+    rover: "Rover",
+    pad: "Landing Pad",
+    resupply: "Resupply Order",
+  }[type] || type);
+
+  const getDiplomacyOptions = (pi) => {
+    const actor = pi === 0 ? p1 : p2;
+    const other = pi === 0 ? p2 : p1;
+    if (!gridSharingEnabled || !actor || !other) return [];
+    const actorId = pi + 1;
+    const otherId = actorId === 1 ? 2 : 1;
+    if (powerGridState.mode === "shared") {
+      if (gridSharingPermanent) return [];
+      return [{ type: "decouple", label: "Decouple Power Grid" }];
+    }
+    if (powerGridState.mode === "offered") {
+      if (powerGridState.offeredTo === actorId) {
+        return [{ type: "join", label: `Join P${powerGridState.offeredBy} Power Grid` }];
+      }
+      if (powerGridState.offeredBy === actorId) {
+        return [];
+      }
+    }
+    return [{ type: "open", label: `Open Power Grid to P${otherId}` }];
+  };
+
+  const applyDiplomacyDelta = (pi, delta) => {
+    const setter = pi === 0 ? setP1 : setP2;
+    setter(player => player ? {
+      ...player,
+      diplomacy: Math.max(-100, Math.min(100, (player.diplomacy ?? 0) + delta)),
+    } : player);
+  };
+
+  const executeDiplomaticDecision = (pi) => {
+    if (replayRun) return;
+    if (phase !== PHASE.PLAYING) return;
+    if (!gridSharingEnabled) return;
+    if ((pi === 0 ? p1Done : p2Done)) return;
+    const actor = pi === 0 ? p1 : p2;
+    const other = pi === 0 ? p2 : p1;
+    if (!actor || !other) return;
+
+    const action = selectedDiplomacy[pi];
+    const actorId = pi + 1;
+    const otherId = actorId === 1 ? 2 : 1;
+    if (!action) return;
+    recordUndoCheckpoint();
+
+    if (action === "open" && powerGridState.mode !== "shared") {
+      setPowerGridState({ mode:"offered", offeredBy: actorId, offeredTo: otherId });
+      applyDiplomacyDelta(pi, 15);
+      appendMissionLog({ type:"diplomacy", actor: actorId, other: otherId, label: `P${actorId} opened its power grid to P${otherId}` });
+    } else if (action === "join" && powerGridState.mode === "offered" && powerGridState.offeredTo === actorId) {
+      setPowerGridState({ mode:"shared", offeredBy: powerGridState.offeredBy, offeredTo: actorId });
+      applyDiplomacyDelta(pi, 10);
+      appendMissionLog({ type:"diplomacy", actor: actorId, other: powerGridState.offeredBy, label: `P${actorId} joined P${powerGridState.offeredBy}'s power grid` });
+    } else if (action === "decouple" && powerGridState.mode === "shared" && !gridSharingPermanent) {
+      setPowerGridState({ mode:"independent", offeredBy: null, offeredTo: null });
+      applyDiplomacyDelta(pi, -25);
+      appendMissionLog({ type:"diplomacy", actor: actorId, other: otherId, label: `P${actorId} decoupled the shared power grid` });
+    }
+
+    setSelectedDiplomacy([null, null]);
+  };
+
   const buildStructure = (pi, type) => {
+    if (replayRun) return;
     const p = pi===0 ? p1 : p2;
     if (!p) return;
     // ── Resupply order: not a structure, an instant healing action ──
@@ -1558,8 +1966,9 @@ export default function App() {
       const hasFunctionalPad = pads.some((_, i) => (padHealths[i] ?? 1.0) > 0);
       if (!hasFunctionalPad) return;
       if ((p.budget ?? 0) < RESUPPLY_COST) return;
-      const keys = ['panels','habitats','extraRovers','landingPads'];
-      const lists = { panels:p.panels||[], habitats:p.habitats||[], extraRovers:p.extraRovers||[], landingPads:pads };
+      recordUndoCheckpoint();
+      const keys = ['panels','reactors','habitats','extraRovers','landingPads'];
+      const lists = { panels:p.panels||[], reactors:p.reactors||[], habitats:p.habitats||[], extraRovers:p.extraRovers||[], landingPads:pads };
       const newSH = {};
       for (const k of keys) newSH[k] = [...(sh0[k] || lists[k].map(()=>1.0))];
       const refs = [];
@@ -1579,6 +1988,7 @@ export default function App() {
       }
       const np = { ...p, budget:(p.budget??0)-RESUPPLY_COST, structureHealth:newSH };
       if (pi===0) setP1(np); else setP2(np);
+      appendMissionLog({ type:"purchase", actor: pi + 1, itemType:"resupply", cost:RESUPPLY_COST, label:`P${pi+1} purchased ${structureLabel("resupply")} for ${RESUPPLY_COST}cr` });
       // Each functional pad receiving this resupply triggers a landing impact
       // at its own coordinates — so a forward pad sitting in enemy zones acts
       // like a missile strike every time you order resupply.
@@ -1588,21 +1998,24 @@ export default function App() {
       return;
     }
     const pads = p.landingPads || [];
-    const padFree = round === 1 || type === "pad"; // turn-1 grace + pads can always be click-placed (anti-softlock)
+    const placementGrace = hasPlacementGrace(p.arrivalDay, globalDay);
+    const padFree = placementGrace || type === "pad"; // arrival grace + pads can always be click-placed (anti-softlock)
     if (pads.length === 0 && !padFree && type !== "rover") return; // need a landing pad first
     const padIdx = pads.length > 0 ? Math.min(selectedPad[pi], pads.length - 1) : 0;
     const { costs } = calcAssetCosts(p.alloc || { mil:20, rd:20, econ:60 });
     const cost = costs[type] ?? 999;
 
-    const maxes = { solar: MAX_PANELS, habitat: MAX_HABITATS, rover: MAX_ROVERS, pad: MAX_PADS };
+    const maxes = { solar: MAX_PANELS, reactor: MAX_REACTORS, habitat: MAX_HABITATS, rover: MAX_ROVERS, pad: MAX_PADS };
     const counts = {
       solar:   p.panels.length,
+      reactor: (p.reactors||[]).length,
       habitat: (p.habitats||[]).length,
       rover:   (p.extraRovers||[]).length,
       pad:     (p.landingPads||[]).length,
     };
     if (counts[type] >= maxes[type]) return;
     if ((p.budget ?? 0) < cost) return;
+    recordUndoCheckpoint();
     const id = Date.now() + Math.random();
     const pts = ASSET_POINTS[type] ?? 0;
     let np;
@@ -1621,24 +2034,29 @@ export default function App() {
                ...p.structureHealth,
                extraRovers: [...(p.structureHealth?.extraRovers || []), 1.0],
              },
-           };
+            };
       landingImpact(pi, p.base.x, p.base.y);
+      appendMissionLog({ type:"purchase", actor: pi + 1, itemType:type, cost, label:`P${pi+1} purchased ${structureLabel(type)} for ${cost}cr and deployed it at base` });
     } else if (padFree) {
-      // Turn-1: all non-rover builds use manual click placement, even if a pad
-      // has already been placed this turn. The pending-delivery flow only
-      // begins from round 2 onward.
+      // During a player's first 7 days after arrival, all non-rover builds can
+      // use manual click placement. After that, non-pad structures must flow
+      // through landing-pad delivery.
       setPlacingFor(pi);
       setPlacingType(type);
+      appendMissionLog({ type:"purchase", actor: pi + 1, itemType:type, cost, label:`P${pi+1} purchased ${structureLabel(type)} for ${cost}cr and is selecting a placement site` });
       return;
     } else {
       np = { ...p, budget: (p.budget ?? 0) - cost,
                    assetPts: (p.assetPts ?? 0) + pts,
-                   pendingDeliveries: [...(p.pendingDeliveries||[]), { id, type, padIdx }] };
+                    pendingDeliveries: [...(p.pendingDeliveries||[]), { id, type, padIdx }] };
+      appendMissionLog({ type:"purchase", actor: pi + 1, itemType:type, cost, label:`P${pi+1} purchased ${structureLabel(type)} for ${cost}cr and routed it to Landing Pad ${padIdx + 1}` });
     }
     if (pi===0) setP1(np); else setP2(np);
   };
 
   const setAlloc = (pi, key, val) => {
+    if (replayRun) return;
+    recordUndoCheckpoint();
     const setter = pi===0 ? setP1 : setP2;
     setter(p => {
       if (!p) return p;
@@ -1662,6 +2080,8 @@ export default function App() {
   };
 
   const clearWaypoints = pi => {
+    if (replayRun) return;
+    recordUndoCheckpoint();
     const rIdx = selectedRover[pi];
     const setFn = pi===0 ? setP1 : setP2;
     setFn(p => {
@@ -1673,12 +2093,18 @@ export default function App() {
       newER[erIdx] = { ...newER[erIdx], waypoints:[], currentWaypoint:null };
       return { ...p, extraRovers: newER };
     });
+    appendMissionLog({
+      type:"waypoint",
+      actor: pi + 1,
+      rover: rIdx + 1,
+      label:`P${pi+1} cleared the route for R${rIdx + 1}`,
+    });
   };
 
   const exportMissionData = () => {
     const rows = [
-      ["round","day","globalDay","type","kg","craterIdx"],
-      ...missionLog.map(e => [e.round, e.day, e.globalDay, e.type, (e.kg||0).toFixed(2), e.craterIdx||""])
+      ["round","day","globalDay","type","kg","craterIdx","label"],
+      ...missionLog.map(e => [e.round, e.day, e.globalDay, e.type, (e.kg||0).toFixed(2), e.craterIdx||"", e.label||""])
     ];
     const csv = rows.map(r => r.join(",")).join("\n");
     const blob = new Blob([csv], { type: "text/csv" });
@@ -1693,13 +2119,14 @@ export default function App() {
       meta: { round, day, globalDay, totalRounds, simMode, timestamp: new Date().toISOString() },
       p1: p1 ? { iceDeposited: p1.iceDeposited, assetPts: p1.assetPts, budget: p1.budget,
                   econ: p1.econ, rdAccum: p1.rdAccum, milStock: p1.milStock, diplomacy: p1.diplomacy,
-                  panels: p1.panels.length, habitats: (p1.habitats||[]).length,
+                  panels: p1.panels.length, reactors: (p1.reactors||[]).length, habitats: (p1.habitats||[]).length,
                   rovers: 1 + (p1.extraRovers||[]).length, pads: (p1.landingPads||[]).length } : null,
       p2: p2 ? { iceDeposited: p2.iceDeposited, assetPts: p2.assetPts, budget: p2.budget,
                   econ: p2.econ, rdAccum: p2.rdAccum, milStock: p2.milStock, diplomacy: p2.diplomacy,
-                  panels: p2.panels.length, habitats: (p2.habitats||[]).length,
+                  panels: p2.panels.length, reactors: (p2.reactors||[]).length, habitats: (p2.habitats||[]).length,
                   rovers: 1 + (p2.extraRovers||[]).length, pads: (p2.landingPads||[]).length } : null,
       history, missionLog, annotations,
+      powerGridState,
       cratersTotal: CRATER_DATA.length,
       cratersHeavilyDepleted: CRATER_DATA.filter((_,ci)=>(craterHealth[ci]||1)<0.2).length,
       physOverrides,
@@ -1712,18 +2139,1232 @@ export default function App() {
   };
 
   const reset = () => {
+    setUndoStack([]);
     setPhase(PHASE.SETTINGS); setP1(null); setP2(null);
     setCraterHealth(new Float32Array(CRATER_DATA.length).fill(1.0));
     setRound(1); setDay(0); setGlobalDay(0); setHistory([]);
     setClaimR([80,80]); setSelectingFor(null); setPlacingFor(null); setPlacingType(null);
     setActiveTurn(0); setP1Done(false); setP2Done(false); setLastEvents([]);
     setSelectedBuild([null, null]);
+    setSelectedDiplomacy([null, null]);
     setSelectedPad([0, 0]);
     setSelectedRover([0, 0]);
     setMapLayer("base");
+    setPowerGridState({ mode:"independent", offeredBy:null, offeredTo:null });
+    setBatchRunning(false);
+    setBatchProgress({ completed:0, total:batchRunCount, currentSeed:null });
+    setBatchResult(null);
+    setReplayRun(null);
+    setReplayFrameIndex(0);
+    setReplayPlaying(false);
+    setReplayLoading(false);
     setMissionLog([]); setAnnotations([]); setAnnotating(false); setAnnotNote("");
     setAutoAdvance(false); setShowLog(false); setShowParams(false); setShowAnalytics(false);
   };
+
+  function makeSeededRng(seed) {
+    let t = seed >>> 0;
+    return () => {
+      t += 0x6D2B79F5;
+      let r = Math.imul(t ^ (t >>> 15), 1 | t);
+      r ^= r + Math.imul(r ^ (r >>> 7), 61 | r);
+      return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function isMapDepleted(ch) {
+    if (!ch) return false;
+    for (let i = 0; i < ch.length; i++) {
+      if ((ch[i] ?? 0) > DEPLETION_END_THRESHOLD) return false;
+    }
+    return true;
+  }
+
+  function clonePlayerState(player) {
+    if (!player) return null;
+    return {
+      ...player,
+      base: player.base ? { ...player.base } : player.base,
+      panels: (player.panels || []).map(p => ({ ...p })),
+      reactors: (player.reactors || []).map(r => ({ ...r })),
+      habitats: (player.habitats || []).map(h => ({ ...h })),
+      habitatPower: [...(player.habitatPower || [])],
+      extraRovers: (player.extraRovers || []).map(r => ({ ...r, waypoints:[...(r.waypoints||[])] })),
+      landingPads: (player.landingPads || []).map(p => ({ ...p })),
+      pendingDeliveries: (player.pendingDeliveries || []).map(d => ({ ...d, target:d.target ? { ...d.target } : d.target })),
+      carrying: player.carrying ? { ...player.carrying, target: player.carrying.target ? { ...player.carrying.target } : player.carrying.target } : null,
+      structureHealth: {
+        panels: [...(player.structureHealth?.panels || [])],
+        reactors: [...(player.structureHealth?.reactors || [])],
+        habitats: [...(player.structureHealth?.habitats || [])],
+        extraRovers: [...(player.structureHealth?.extraRovers || [])],
+        landingPads: [...(player.structureHealth?.landingPads || [])],
+      },
+      waypoints: [...(player.waypoints || [])],
+      currentWaypoint: player.currentWaypoint ? { ...player.currentWaypoint } : null,
+      mineMap: { ...(player.mineMap || {}) },
+      depositLog: [...(player.depositLog || [])],
+      alloc: { ...(player.alloc || {}) },
+      generatorRangeEntries: JSON.parse(JSON.stringify(player.generatorRangeEntries || {})),
+      botMemory: player.botMemory ? JSON.parse(JSON.stringify(player.botMemory)) : undefined,
+    };
+  }
+
+  function scorePlayerState(player) {
+    if (!player) return 0;
+    return (player.iceDeposited ?? 0) + (player.assetPts ?? 0) * 15 + (player.diplomacy ?? 0) * 3;
+  }
+
+  function structureCounts(player) {
+    return player ? {
+      habitats: (player.habitats || []).length,
+      panels: (player.panels || []).length,
+      reactors: (player.reactors || []).length,
+      rovers: 1 + (player.extraRovers || []).length,
+      pads: (player.landingPads || []).length,
+    } : { habitats:0, panels:0, reactors:0, rovers:0, pads:0 };
+  }
+
+  function snapshotSimState(sim) {
+    return {
+      round: sim.round,
+      day: sim.day,
+      globalDay: sim.globalDay,
+      claimR: [...sim.claimR],
+      powerGridState: { ...sim.powerGridState },
+      p1: clonePlayerState(sim.p1),
+      p2: clonePlayerState(sim.p2),
+      craterHealth: Array.from(sim.craterHealth || []),
+      history: [...(sim.history || [])].map(h => ({ ...h })),
+      logLength: (sim.missionLog || []).length,
+      phase: sim.phase || PHASE.PLAYING,
+    };
+  }
+
+  function getUndoSegmentKey(snapshot = {}) {
+    const phaseValue = snapshot.phase ?? phase;
+    const roundValue = snapshot.round ?? round;
+    const dayValue = snapshot.day ?? day;
+    const globalDayValue = snapshot.globalDay ?? globalDay;
+    const activeTurnValue = snapshot.activeTurn ?? activeTurn;
+    const p1DoneValue = snapshot.p1Done ?? p1Done;
+    const p2DoneValue = snapshot.p2Done ?? p2Done;
+    if (phaseValue === PHASE.PLAYING || phaseValue === PHASE.DONE) {
+      return `play|${roundValue}|${dayValue}|${globalDayValue}|${activeTurnValue}|${p1DoneValue ? 1 : 0}|${p2DoneValue ? 1 : 0}`;
+    }
+    return `phase|${phaseValue}|${roundValue}|${dayValue}|${globalDayValue}`;
+  }
+
+  function captureUndoSnapshot() {
+    return {
+      segmentKey: getUndoSegmentKey(),
+      phase,
+      p1: clonePlayerState(p1),
+      p2: clonePlayerState(p2),
+      craterHealth: Array.from(craterHealth || []),
+      round,
+      day,
+      globalDay,
+      history: history.map(h => ({ ...h })),
+      claimR: [...claimR],
+      activeTurn,
+      p1Done,
+      p2Done,
+      selectingFor,
+      placingFor,
+      placingType,
+      selectedRover: [...selectedRover],
+      addingWaypoint,
+      lastEvents: lastEvents.map(ev => ({ ...ev })),
+      selectedBuild: [...selectedBuild],
+      selectedDiplomacy: [...selectedDiplomacy],
+      selectedPad: [...selectedPad],
+      mapLayer,
+      powerGridState: { ...powerGridState },
+      missionLog: missionLog.map(ev => ({ ...ev })),
+      annotations: annotations.map(ann => ({ ...ann })),
+    };
+  }
+
+  function applyUndoSnapshot(snapshot) {
+    if (!snapshot) return;
+    setPhase(snapshot.phase);
+    setP1(clonePlayerState(snapshot.p1));
+    setP2(clonePlayerState(snapshot.p2));
+    setCraterHealth(new Float32Array(snapshot.craterHealth || []));
+    setRound(snapshot.round);
+    setDay(snapshot.day);
+    setGlobalDay(snapshot.globalDay);
+    setHistory((snapshot.history || []).map(h => ({ ...h })));
+    setClaimR([...(snapshot.claimR || [80, 80])]);
+    setActiveTurn(snapshot.activeTurn ?? 0);
+    setP1Done(!!snapshot.p1Done);
+    setP2Done(!!snapshot.p2Done);
+    setSelectingFor(snapshot.selectingFor ?? null);
+    setPlacingFor(snapshot.placingFor ?? null);
+    setPlacingType(snapshot.placingType ?? null);
+    setSelectedRover([...(snapshot.selectedRover || [0, 0])]);
+    setAddingWaypoint(!!snapshot.addingWaypoint);
+    setLastEvents((snapshot.lastEvents || []).map(ev => ({ ...ev })));
+    setSelectedBuild([...(snapshot.selectedBuild || [null, null])]);
+    setSelectedDiplomacy([...(snapshot.selectedDiplomacy || [null, null])]);
+    setSelectedPad([...(snapshot.selectedPad || [0, 0])]);
+    setMapLayer(snapshot.mapLayer || "base");
+    setPowerGridState({ ...(snapshot.powerGridState || { mode:"independent", offeredBy:null, offeredTo:null }) });
+    setMissionLog((snapshot.missionLog || []).map(ev => ({ ...ev })));
+    setAnnotations((snapshot.annotations || []).map(ann => ({ ...ann })));
+  }
+
+  const recordUndoCheckpoint = () => {
+    if (replayRun || batchRunning || phase === PHASE.SETTINGS || phase === PHASE.BATCH) return;
+    const snapshot = captureUndoSnapshot();
+    setUndoStack(prev => {
+      if (prev[prev.length - 1]?.segmentKey === snapshot.segmentKey) return prev;
+      return [...prev, snapshot];
+    });
+  };
+
+  const undoLastTurn = () => {
+    if (replayRun || batchRunning) return;
+    const snapshot = undoStack[undoStack.length - 1];
+    if (!snapshot) return;
+    applyUndoSnapshot(snapshot);
+    setUndoStack(prev => prev.slice(0, -1));
+  };
+
+  function countNearbyEnemyStructuresState(enemyP, x, y, radius = SAFETY_RADIUS.reactor) {
+    if (!enemyP) return 0;
+    const eLists = [
+      { list: enemyP.panels || [], key: "panels" },
+      { list: enemyP.reactors || [], key: "reactors" },
+      { list: enemyP.habitats || [], key: "habitats" },
+      { list: enemyP.extraRovers || [], key: "extraRovers" },
+      { list: enemyP.landingPads || [], key: "landingPads" },
+    ];
+    let count = 0;
+    for (const { list, key } of eLists) {
+      const healths = enemyP.structureHealth?.[key] || list.map(() => 1.0);
+      for (let i = 0; i < list.length; i++) {
+        if ((healths[i] ?? 1.0) <= 0) continue;
+        if (d2({ x, y }, list[i]) < radius) count++;
+      }
+    }
+    return count;
+  }
+
+  function applyPureReactorPlacementPenalty(playerState, enemyState, x, y) {
+    const nearby = countNearbyEnemyStructuresState(enemyState, x, y);
+    if (nearby <= 0 || !playerState) return playerState;
+    return {
+      ...playerState,
+      diplomacy: Math.max(-100, Math.min(100, (playerState.diplomacy ?? 0) - nearby * REACTOR_DIPLOMACY_PENALTY)),
+    };
+  }
+
+  function applyPureLandingImpact(players, actorIdx, lx, ly) {
+    const nextPlayers = players.map(p => clonePlayerState(p));
+    const enemyIdx = actorIdx === 0 ? 1 : 0;
+    const enemyP = nextPlayers[enemyIdx];
+    const actorP = nextPlayers[actorIdx];
+    if (!enemyP || !actorP) return nextPlayers;
+    const eSh = { ...(enemyP.structureHealth || {}) };
+    const eLists = {
+      panels: enemyP.panels || [],
+      reactors: enemyP.reactors || [],
+      habitats: enemyP.habitats || [],
+      extraRovers: enemyP.extraRovers || [],
+      landingPads: enemyP.landingPads || [],
+    };
+    const typeFor = { panels:"solar", reactors:"reactor", habitats:"habitat", extraRovers:"rover", landingPads:"pad" };
+    let totalDamage = 0;
+    for (const k of Object.keys(eLists)) {
+      const arr = [...(eSh[k] || eLists[k].map(() => 1.0))];
+      const radius = SAFETY_RADIUS[typeFor[k]];
+      for (let ei = 0; ei < eLists[k].length; ei++) {
+        const before = arr[ei] ?? 1.0;
+        if (before <= 0) continue;
+        if (d2({ x: lx, y: ly }, eLists[k][ei]) < radius) {
+          const after = Math.max(0, before - LANDING_DAMAGE);
+          totalDamage += before - after;
+          arr[ei] = after;
+        }
+      }
+      eSh[k] = arr;
+    }
+    nextPlayers[enemyIdx] = { ...enemyP, structureHealth: eSh };
+    if (totalDamage > 0) {
+      nextPlayers[actorIdx] = {
+        ...actorP,
+        diplomacy: Math.max(-100, Math.min(100, (actorP.diplomacy ?? 0) - totalDamage * LANDING_DIPLOMACY_PENALTY)),
+      };
+    }
+    return nextPlayers;
+  }
+
+  function findBestIllumSiteNear(x, y, maxRadius = Math.ceil(SAFETY_RADIUS.solar) + 2) {
+    let best = { x: Math.round(x), y: Math.round(y), illum: 0 };
+    for (let dy = -maxRadius; dy <= maxRadius; dy++) {
+      for (let dx = -maxRadius; dx <= maxRadius; dx++) {
+        const nx = Math.round(x + dx), ny = Math.round(y + dy);
+        if (nx < 0 || nx >= W || ny < 0 || ny >= H) continue;
+        const dist = Math.hypot(dx, dy);
+        if (dist > maxRadius) continue;
+        const illum = ILLUM_MAP[ny * W + nx] || 0;
+        if (illum > best.illum) best = { x: nx, y: ny, illum };
+      }
+    }
+    return best;
+  }
+
+  function getCraterClusterScore(ci) {
+    const c = CRATER_DATA[ci];
+    if (!c) return 0;
+    let score = c.size / 18;
+    for (let oi = 0; oi < CRATER_DATA.length; oi++) {
+      if (oi === ci) continue;
+      const other = CRATER_DATA[oi];
+      const dist = Math.hypot(c.cx - other.cx, c.cy - other.cy);
+      if (dist > 120) continue;
+      score += (other.size / 45) / Math.max(1, dist / 20);
+    }
+    return score;
+  }
+
+  function chooseStartCrater(otherBase, rng) {
+    const ranked = CRATER_DATA.map((crater, ci) => {
+      const illum = findBestIllumSiteNear(crater.cx, crater.cy, 10).illum;
+      const cluster = getCraterClusterScore(ci);
+      const otherPenalty = otherBase ? Math.max(0, 30 - Math.hypot(crater.cx - otherBase.x, crater.cy - otherBase.y)) * 2 : 0;
+      return {
+        ci,
+        score: crater.size / 10 + cluster + illum * 60 - otherPenalty,
+      };
+    }).sort((a, b) => b.score - a.score);
+    const top = ranked.slice(0, Math.min(12, ranked.length));
+    const weighted = top.map((item, idx) => ({
+      ...item,
+      pickWeight: Math.max(1, item.score - idx * 6 + rng() * 10),
+    }));
+    const totalWeight = weighted.reduce((sum, item) => sum + item.pickWeight, 0);
+    let roll = rng() * Math.max(1, totalWeight);
+    for (const item of weighted) {
+      roll -= item.pickWeight;
+      if (roll <= 0) return item.ci;
+    }
+    return weighted[0]?.ci ?? ranked[0]?.ci ?? 0;
+  }
+
+  function chooseBasePositionForCrater(craterIdx, rng) {
+    const crater = CRATER_DATA[craterIdx];
+    if (!crater) return snapToPSR(W / 2, H / 2);
+    const jitter = 3 + Math.floor(rng() * 5);
+    const dx = Math.round((rng() - 0.5) * jitter * 2);
+    const dy = Math.round((rng() - 0.5) * jitter * 2);
+    return snapToPSR(crater.cx + dx, crater.cy + dy);
+  }
+
+  function findTopIllumSitesNear(x, y, radius, limit = 8) {
+    const candidates = [];
+    for (let dy = -radius; dy <= radius; dy++) {
+      for (let dx = -radius; dx <= radius; dx++) {
+        const nx = Math.round(x + dx), ny = Math.round(y + dy);
+        if (nx < 0 || nx >= W || ny < 0 || ny >= H) continue;
+        const dist = Math.hypot(dx, dy);
+        if (dist > radius) continue;
+        const illum = ILLUM_MAP[ny * W + nx] ?? 0;
+        candidates.push({ x:nx, y:ny, illum, dist });
+      }
+    }
+    return candidates
+      .sort((a, b) => b.illum - a.illum || a.dist - b.dist)
+      .slice(0, limit);
+  }
+
+  function jitterToward(crater, site, rng, minDist = 2, maxDist = 7) {
+    const angle = rng() * Math.PI * 2;
+    const dist = minDist + rng() * (maxDist - minDist);
+    const raw = {
+      x: Math.round(site.x + Math.cos(angle) * dist),
+      y: Math.round(site.y + Math.sin(angle) * dist),
+    };
+    const clamped = {
+      x: clamp(raw.x, 0, W - 1),
+      y: clamp(raw.y, 0, H - 1),
+    };
+    return d2(clamped, crater) < maxDist + 10 ? clamped : { x:site.x, y:site.y };
+  }
+
+  function chooseHubPlanForCrater(craterIdx, rng) {
+    const crater = CRATER_DATA[craterIdx];
+    if (!crater) return { habitatTarget:{ x:W/2, y:H/2 }, generatorType:"reactor", generatorTarget:{ x:W/2, y:H/2 } };
+    const illumChoices = findTopIllumSitesNear(crater.cx, crater.cy, Math.ceil(SAFETY_RADIUS.solar) + 16, 10);
+    const weighted = illumChoices
+      .map((site, idx) => ({
+        ...site,
+        rankScore: (site.illum * 100) - site.dist * 1.4 - idx * 1.2 + (rng() - 0.5) * 8,
+      }))
+      .sort((a, b) => b.rankScore - a.rankScore);
+    const site = weighted[Math.floor(rng() * Math.min(4, weighted.length || 1))] || { x:crater.cx, y:crater.cy, illum:0 };
+    const habitatTarget = jitterToward(crater, site, rng, 2, 8);
+    const generatorTarget = { x:site.x, y:site.y };
+    const padTarget = jitterToward(crater, habitatTarget, rng, 8, 16);
+    return {
+      habitatTarget,
+      generatorType: "solar",
+      generatorTarget,
+      padTarget,
+      fallbackReactorTarget: { x: crater.cx, y: crater.cy },
+      illumScore: site.illum,
+    };
+  }
+
+  function updateSimPlayer(sim, pi, updater) {
+    const key = pi === 0 ? "p1" : "p2";
+    return { ...sim, [key]: updater(sim[key]) };
+  }
+
+  function getBotHub(player) {
+    if (!player) return null;
+    if ((player.habitats || []).length > 0) return player.habitats[0];
+    return player.botMemory?.hubPlan?.habitatTarget || player.base;
+  }
+
+  function getAllRoverStates(player) {
+    if (!player) return [];
+    return [
+      { roverIdx:0, rover:player },
+      ...((player.extraRovers || []).map((rover, idx) => ({ roverIdx:idx + 1, rover }))),
+    ];
+  }
+
+  function getRechargeCoverageScore(player, point) {
+    if (!player || !point) return 0;
+    const generators = [
+      ...(player.panels || []).map(p => ({ ...p, kind:"solar" })),
+      ...(player.reactors || []).map(r => ({ ...r, kind:"reactor" })),
+    ];
+    let score = 0;
+    for (const generator of generators) {
+      if (d2(generator, point) <= SAFETY_RADIUS[generator.kind]) {
+        score += generator.kind === "reactor" ? 2.5 : 1;
+      }
+    }
+    return score;
+  }
+
+  function chooseExpansionPlan(sim, actor, rng) {
+    if (!actor) return null;
+    const roverEntries = getAllRoverStates(actor);
+    const weakestRover = roverEntries
+      .map(entry => ({ ...entry, power: entry.rover.power ?? POWER_CAP }))
+      .sort((a, b) => a.power - b.power)[0];
+    const ranked = selectOperationalCraters(sim, actor, weakestRover?.rover ? { x:weakestRover.rover.x, y:weakestRover.rover.y } : getBotHub(actor));
+    const targetCraterIdx = ranked[0]?.ci ?? actor.botMemory?.homeCraterIdx;
+    const crater = CRATER_DATA[targetCraterIdx];
+    if (!crater) return null;
+    const illumChoices = findTopIllumSitesNear(crater.cx, crater.cy, Math.ceil(SAFETY_RADIUS.solar) + 20, 12);
+    const pick = illumChoices[Math.floor(rng() * Math.min(5, illumChoices.length || 1))] || { x:crater.cx, y:crater.cy, illum:0 };
+    const solarTarget = { x:pick.x, y:pick.y };
+    const habitatTarget = jitterToward(crater, pick, rng, 2, 9);
+    const padTarget = jitterToward(crater, habitatTarget, rng, 10, 18);
+    return { craterIdx:targetCraterIdx, solarTarget, habitatTarget, padTarget, illum:pick.illum };
+  }
+
+  function tryBotPurchase(sim, pi, type, target, opts = {}) {
+    const nextSim = buildHeadlessStructure(sim, pi, type, target, opts);
+    return nextSim;
+  }
+
+  function estimateTravelPowerCost(dist, ice = 0, carrying = false) {
+    const loadFactor = Math.min(3.0, 1.0 + (ice / 100) + (carrying ? 0.5 : 0));
+    return POWER_BASE_DRAIN + POWER_MOVE_DRAIN * (dist / Math.max(1, ROVER_STEP)) * loadFactor;
+  }
+
+  function getPendingPickupTarget(player, roverPos) {
+    if (!player) return null;
+    const pads = player.landingPads || [];
+    const pending = player.pendingDeliveries || [];
+    if (!pads.length || !pending.length) return null;
+    const grouped = pending
+      .map(item => ({ item, pad: pads[item.padIdx], dist: pads[item.padIdx] ? d2(roverPos, pads[item.padIdx]) : Infinity }))
+      .filter(entry => entry.pad)
+      .sort((a, b) => a.dist - b.dist);
+    return grouped[0]?.pad || null;
+  }
+
+  function pointInGeneratorCoverage(targets, point) {
+    if (!point) return false;
+    return (targets || []).some(target => d2(point, target) <= SAFETY_RADIUS[target.kind]);
+  }
+
+  function getRoverState(player, roverIdx) {
+    return roverIdx === 0 ? player : (player.extraRovers || [])[roverIdx - 1];
+  }
+
+  function setRoverWaypointForPlayer(player, roverIdx, target) {
+    if (!player || !target) return player;
+    const waypoint = { x: Math.round(target.x), y: Math.round(target.y) };
+    if (roverIdx === 0) {
+      return { ...player, waypoints:[waypoint], currentWaypoint:null };
+    }
+    const extraRovers = [...(player.extraRovers || [])];
+    const rover = extraRovers[roverIdx - 1];
+    if (!rover) return player;
+    extraRovers[roverIdx - 1] = { ...rover, waypoints:[waypoint], currentWaypoint:null };
+    return { ...player, extraRovers };
+  }
+
+  function buildHeadlessStructure(sim, pi, type, target, opts = {}) {
+    const players = [clonePlayerState(sim.p1), clonePlayerState(sim.p2)];
+    const player = players[pi];
+    if (!player) return sim;
+    const pads = player.landingPads || [];
+    const padFree = hasPlacementGrace(player.arrivalDay, sim.globalDay) || type === "pad" || opts.forceDirect === true;
+    if (pads.length === 0 && !padFree && type !== "rover") return sim;
+    const { costs } = calcAssetCosts(player.alloc || { mil:20, rd:20, econ:60, budget:20 });
+    const cost = costs[type] ?? 999;
+    const maxes = { solar: MAX_PANELS, reactor: MAX_REACTORS, habitat: MAX_HABITATS, rover: MAX_ROVERS, pad: MAX_PADS };
+    const counts = {
+      solar: player.panels.length,
+      reactor: (player.reactors || []).length,
+      habitat: (player.habitats || []).length,
+      rover: (player.extraRovers || []).length,
+      pad: (player.landingPads || []).length,
+    };
+    if ((counts[type] ?? 0) >= (maxes[type] ?? Infinity)) return sim;
+    if ((player.budget ?? 0) < cost) return sim;
+
+    let nextPlayer = clonePlayerState(player);
+    nextPlayer.budget = (nextPlayer.budget ?? 0) - cost;
+    nextPlayer.assetPts = (nextPlayer.assetPts ?? 0) + (ASSET_POINTS[type] ?? 0);
+
+    if (type === "rover") {
+      nextPlayer.extraRovers = [
+        ...(nextPlayer.extraRovers || []),
+        { x: nextPlayer.base.x, y: nextPlayer.base.y, waypoints:[], currentWaypoint:null, ice:0, carrying:null, status:"idle", power:POWER_CAP },
+      ];
+      nextPlayer.structureHealth = {
+        ...nextPlayer.structureHealth,
+        extraRovers: [...(nextPlayer.structureHealth?.extraRovers || []), 1.0],
+      };
+      players[pi] = nextPlayer;
+      const impacted = applyPureLandingImpact(players, pi, nextPlayer.base.x, nextPlayer.base.y);
+      return { ...sim, p1: impacted[0], p2: impacted[1], nextId: sim.nextId + 1 };
+    }
+
+    if (padFree) {
+      const placed = { x: Math.round(target.x), y: Math.round(target.y) };
+      if (type === "solar") {
+        nextPlayer.panels = [...nextPlayer.panels, { ...placed, onRidge: RIDGE_MASK[placed.y * W + placed.x] === 1 }];
+        nextPlayer.structureHealth = { ...nextPlayer.structureHealth, panels: [...(nextPlayer.structureHealth?.panels || []), 1.0] };
+      } else if (type === "reactor") {
+        nextPlayer.reactors = [...(nextPlayer.reactors || []), placed];
+        nextPlayer.structureHealth = { ...nextPlayer.structureHealth, reactors: [...(nextPlayer.structureHealth?.reactors || []), 1.0] };
+      } else if (type === "habitat") {
+        nextPlayer.habitats = [...(nextPlayer.habitats || []), placed];
+        nextPlayer.habitatPower = [...(nextPlayer.habitatPower || []), HABITAT_POWER_INIT];
+        nextPlayer.structureHealth = { ...nextPlayer.structureHealth, habitats: [...(nextPlayer.structureHealth?.habitats || []), 1.0] };
+      } else if (type === "pad") {
+        nextPlayer.landingPads = [...(nextPlayer.landingPads || []), placed];
+        nextPlayer.structureHealth = { ...nextPlayer.structureHealth, landingPads: [...(nextPlayer.structureHealth?.landingPads || []), 1.0] };
+      }
+      players[pi] = nextPlayer;
+      if (type === "reactor") {
+        players[pi] = applyPureReactorPlacementPenalty(players[pi], players[pi === 0 ? 1 : 0], placed.x, placed.y);
+        return { ...sim, p1: players[0], p2: players[1], nextId: sim.nextId + 1 };
+      }
+      const impacted = applyPureLandingImpact(players, pi, placed.x, placed.y);
+      return { ...sim, p1: impacted[0], p2: impacted[1], nextId: sim.nextId + 1 };
+    }
+
+    const padIdx = Math.min(opts.padIdx ?? 0, Math.max(0, pads.length - 1));
+    nextPlayer.pendingDeliveries = [
+      ...(nextPlayer.pendingDeliveries || []),
+      { id: sim.nextId, type, padIdx, target: target ? { x: Math.round(target.x), y: Math.round(target.y) } : null },
+    ];
+    players[pi] = nextPlayer;
+    return { ...sim, p1: players[0], p2: players[1], nextId: sim.nextId + 1 };
+  }
+
+  function ensureBotInitialSetup(sim, pi) {
+    let nextSim = sim;
+    let actor = pi === 0 ? nextSim.p1 : nextSim.p2;
+    if (!actor) return nextSim;
+    const hubPlan = actor.botMemory?.hubPlan;
+    if (!hubPlan) return nextSim;
+
+    if ((actor.landingPads || []).length === 0 && (actor.budget ?? 0) >= BASE_ASSET_COSTS.pad) {
+      nextSim = buildHeadlessStructure(nextSim, pi, "pad", hubPlan.padTarget || actor.base, { forceDirect:true });
+      actor = pi === 0 ? nextSim.p1 : nextSim.p2;
+    }
+    if ((actor.habitats || []).length === 0) {
+      nextSim = buildHeadlessStructure(nextSim, pi, "habitat", hubPlan.habitatTarget, { forceDirect:true });
+      actor = pi === 0 ? nextSim.p1 : nextSim.p2;
+    }
+    if (((actor.reactors || []).length + actor.panels.length) === 0) {
+      nextSim = buildHeadlessStructure(nextSim, pi, hubPlan.generatorType, hubPlan.generatorTarget, { forceDirect:true });
+      actor = pi === 0 ? nextSim.p1 : nextSim.p2;
+    }
+    if ((1 + ((actor.extraRovers || []).length)) < 2 && hubPlan.generatorType === "solar" && (actor.budget ?? 0) >= BASE_ASSET_COSTS.rover) {
+      nextSim = buildHeadlessStructure(nextSim, pi, "rover", actor.base);
+    }
+    return updateSimPlayer(nextSim, pi, p => ({
+      ...p,
+      botMemory: {
+        ...(p.botMemory || {}),
+        initialSetupDone: (p.landingPads || []).length > 0 && (p.habitats || []).length > 0 && (((p.reactors || []).length + (p.panels || []).length) > 0),
+      },
+    }));
+  }
+
+  function getAccessibleRechargeTargets(sim, pi) {
+    const actor = pi === 0 ? sim.p1 : sim.p2;
+    const other = pi === 0 ? sim.p2 : sim.p1;
+    if (!actor) return [];
+    const shared = sim.powerGridState.mode === "shared";
+    const sourcePlayers = shared && other ? [actor, other] : [actor];
+    const targets = [];
+    for (const source of sourcePlayers) {
+      (source.panels || []).forEach((panel, idx) => {
+        if ((source.structureHealth?.panels?.[idx] ?? 1.0) <= 0) return;
+        targets.push({ x:panel.x, y:panel.y, kind:"solar", ownerId:source.id });
+      });
+      (source.reactors || []).forEach((reactor, idx) => {
+        if ((source.structureHealth?.reactors?.[idx] ?? 1.0) <= 0) return;
+        targets.push({ x:reactor.x, y:reactor.y, kind:"reactor", ownerId:source.id });
+      });
+    }
+    return targets;
+  }
+
+  function getHostileZoneCountAtPoint(enemy, point, sharedGridActive) {
+    if (!enemy || !point) return 0;
+    const structures = [
+      { list: enemy.habitats || [], type:"habitat", healths: enemy.structureHealth?.habitats || [] },
+      { list: enemy.landingPads || [], type:"pad", healths: enemy.structureHealth?.landingPads || [] },
+      { list: enemy.extraRovers || [], type:"rover", healths: enemy.structureHealth?.extraRovers || [] },
+      ...(sharedGridActive ? [] : [
+        { list: enemy.panels || [], type:"solar", healths: enemy.structureHealth?.panels || [] },
+        { list: enemy.reactors || [], type:"reactor", healths: enemy.structureHealth?.reactors || [] },
+      ]),
+    ];
+    let count = 0;
+    for (const { list, type, healths } of structures) {
+      list.forEach((struct, idx) => {
+        if ((healths[idx] ?? 1.0) <= 0) return;
+        if (d2(point, struct) < SAFETY_RADIUS[type]) count++;
+      });
+    }
+    return count;
+  }
+
+  function estimateSharedGridBenefit(receiver, donor) {
+    if (!receiver || !donor) return 0;
+    const targets = [
+      { x: receiver.x, y: receiver.y },
+      ...(receiver.extraRovers || []).map(r => ({ x:r.x, y:r.y })),
+      ...(receiver.habitats || []).map(h => ({ x:h.x, y:h.y })),
+    ];
+    const generators = [
+      ...(donor.panels || []).map(p => ({ ...p, kind:"solar" })),
+      ...(donor.reactors || []).map(r => ({ ...r, kind:"reactor" })),
+    ];
+    let count = 0;
+    for (const target of targets) {
+      if (generators.some(g => d2(g, target) <= SAFETY_RADIUS[g.kind])) count++;
+    }
+    return count;
+  }
+
+  function applyHeadlessDiplomacyDecision(sim, pi, action) {
+    if (!sim.allowGridSharing) return sim;
+    const players = [clonePlayerState(sim.p1), clonePlayerState(sim.p2)];
+    const actor = players[pi];
+    const other = players[pi === 0 ? 1 : 0];
+    if (!actor || !other || !action) return sim;
+    const actorId = pi + 1;
+    const otherId = actorId === 1 ? 2 : 1;
+    let powerGrid = { ...sim.powerGridState };
+    const flags = { ...(sim.batchFlags || {}) };
+    const keepReplayData = sim.keepReplayData !== false;
+    if (action === "open" && powerGrid.mode !== "shared") {
+      powerGrid = { mode:"offered", offeredBy: actorId, offeredTo: otherId };
+      actor.diplomacy = Math.max(-100, Math.min(100, (actor.diplomacy ?? 0) + 15));
+      flags.offers = (flags.offers || 0) + 1;
+      return {
+        ...sim,
+        p1: players[0],
+        p2: players[1],
+        powerGridState: powerGrid,
+        batchFlags: flags,
+        missionLog: keepReplayData ? [...(sim.missionLog || []), { round:sim.round, day:sim.day, globalDay:sim.globalDay, type:"diplomacy", label:`P${actorId} opened its power grid to P${otherId}` }] : (sim.missionLog || []),
+      };
+    }
+    if (action === "join" && powerGrid.mode === "offered" && powerGrid.offeredTo === actorId) {
+      powerGrid = { mode:"shared", offeredBy: powerGrid.offeredBy, offeredTo: actorId };
+      actor.diplomacy = Math.max(-100, Math.min(100, (actor.diplomacy ?? 0) + 10));
+      flags.joins = (flags.joins || 0) + 1;
+      return {
+        ...sim,
+        p1: players[0],
+        p2: players[1],
+        powerGridState: powerGrid,
+        batchFlags: flags,
+        missionLog: keepReplayData ? [...(sim.missionLog || []), { round:sim.round, day:sim.day, globalDay:sim.globalDay, type:"diplomacy", label:`P${actorId} joined P${powerGrid.offeredBy}'s power grid` }] : (sim.missionLog || []),
+      };
+    }
+    if (action === "decouple" && powerGrid.mode === "shared" && !sim.permanentGridSharing) {
+      powerGrid = { mode:"independent", offeredBy:null, offeredTo:null };
+      actor.diplomacy = Math.max(-100, Math.min(100, (actor.diplomacy ?? 0) - 25));
+      flags.decouples = (flags.decouples || 0) + 1;
+      return {
+        ...sim,
+        p1: players[0],
+        p2: players[1],
+        powerGridState: powerGrid,
+        batchFlags: flags,
+        missionLog: keepReplayData ? [...(sim.missionLog || []), { round:sim.round, day:sim.day, globalDay:sim.globalDay, type:"diplomacy", label:`P${actorId} decoupled the shared power grid` }] : (sim.missionLog || []),
+      };
+    }
+    return sim;
+  }
+
+  function selectOperationalCraters(sim, player, roverPos) {
+    const anchor = getBotHub(player);
+    const enemy = player?.id === 1 ? sim.p2 : sim.p1;
+    const sharedGridActive = sim.powerGridState.mode === "shared";
+    const homeCraterIdx = player?.botMemory?.homeCraterIdx ?? PIXEL_CRATER[Math.round(player.base.y) * W + Math.round(player.base.x)];
+    const ranked = CRATER_DATA.map((crater, ci) => {
+      const health = sim.craterHealth?.[ci] ?? 1.0;
+      if (health <= 0.08) return null;
+      const distHub = Math.max(1, d2(anchor, crater));
+      const distRover = Math.max(1, d2(roverPos, crater));
+      const distEnemy = enemy ? d2(enemy.base, crater) : distHub + 10;
+      const illum = findBestIllumSiteNear(crater.cx, crater.cy, 8).illum;
+       const hazard = getHostileZoneCountAtPoint(enemy, crater, sharedGridActive);
+      const score = (health * crater.size * 2.5) / (10 + distHub * 0.8 + distRover * 0.4)
+        + (distEnemy - distHub) * 0.08
+        + illum * 18
+        - hazard * 18
+        + (ci === homeCraterIdx ? 15 : 0);
+      return { ci, score };
+    }).filter(Boolean).sort((a, b) => b.score - a.score);
+    return ranked;
+  }
+
+  function chooseBotDiplomacyAction(sim, pi) {
+    const actor = pi === 0 ? sim.p1 : sim.p2;
+    const other = pi === 0 ? sim.p2 : sim.p1;
+    if (!sim.allowGridSharing || !actor || !other) return null;
+    const selfBenefit = estimateSharedGridBenefit(actor, other);
+    const otherBenefit = estimateSharedGridBenefit(other, actor);
+    const actorGenerators = (actor.panels || []).length + (actor.reactors || []).length;
+    if (sim.powerGridState.mode === "shared") {
+      if (sim.permanentGridSharing) return null;
+      if (otherBenefit - selfBenefit >= 2 && (actor.diplomacy ?? 0) > -20) return "decouple";
+      return null;
+    }
+    if (sim.powerGridState.mode === "offered") {
+      if (sim.powerGridState.offeredTo === actor.id && (selfBenefit >= 1 || actorGenerators === 0 || (actor.diplomacy ?? 0) < 10)) {
+        return "join";
+      }
+      return null;
+    }
+    if (actorGenerators > 0 && otherBenefit >= 1) {
+      if (actor.id === 1 || (actor.diplomacy ?? 0) < 15 || scorePlayerState(actor) >= scorePlayerState(other) - 25) {
+        return "open";
+      }
+    }
+    return null;
+  }
+
+  function planBotTurn(sim, pi, rng) {
+    let nextSim = sim;
+    const player = pi === 0 ? nextSim.p1 : nextSim.p2;
+    if (!player || player.active === false || nextSim.globalDay < (player.arrivalDay ?? 0)) return nextSim;
+
+    if (!player.botMemory?.initialized) {
+      const homeCraterIdx = PIXEL_CRATER[Math.round(player.base.y) * W + Math.round(player.base.x)];
+      const hubPlan = chooseHubPlanForCrater(homeCraterIdx, rng);
+      nextSim = updateSimPlayer(nextSim, pi, p => ({
+        ...p,
+        botMemory: { ...(p.botMemory || {}), initialized:true, homeCraterIdx, hubPlan },
+      }));
+    }
+
+    const updatedPlayer = pi === 0 ? nextSim.p1 : nextSim.p2;
+    const action = chooseBotDiplomacyAction(nextSim, pi);
+    if (action) nextSim = applyHeadlessDiplomacyDecision(nextSim, pi, action);
+
+    let actor = pi === 0 ? nextSim.p1 : nextSim.p2;
+    const roverEntries = getAllRoverStates(actor);
+    const weakestRover = roverEntries
+      .map(entry => ({ ...entry, power: entry.rover.power ?? POWER_CAP, ice: entry.rover.ice ?? 0 }))
+      .sort((a, b) => a.power - b.power || b.ice - a.ice)[0];
+    const expansionPlan = chooseExpansionPlan(nextSim, actor, rng);
+    const roverCount = getAllRoverStates(actor).length;
+    const generatorCount = (actor.panels || []).length + (actor.reactors || []).length;
+    const habitatCount = (actor.habitats || []).length;
+    const effectiveDemand = roverCount + habitatCount;
+
+    if (!actor.botMemory?.initialSetupDone || (actor.habitats || []).length === 0 || (((actor.reactors || []).length + actor.panels.length) === 0)) {
+      nextSim = ensureBotInitialSetup(nextSim, pi);
+      actor = pi === 0 ? nextSim.p1 : nextSim.p2;
+    } else if ((actor.landingPads || []).length === 0 && (actor.budget ?? 0) >= BASE_ASSET_COSTS.pad) {
+      nextSim = buildHeadlessStructure(nextSim, pi, "pad", actor.botMemory?.hubPlan?.padTarget || actor.base, { forceDirect: hasPlacementGrace(actor.arrivalDay, nextSim.globalDay) });
+      actor = pi === 0 ? nextSim.p1 : nextSim.p2;
+    }
+
+    if ((actor.reactors || []).length === 0 && (actor.landingPads || []).length > 0 && (actor.budget ?? 0) >= (BASE_ASSET_COSTS.reactor + 30)) {
+      const lowIllumHub = (actor.botMemory?.hubPlan?.illumScore ?? 0) < 0.48;
+      const reactorNeed = lowIllumHub || (actor.panels || []).length >= Math.max(3, (actor.habitats || []).length + 1);
+      if (nextSim.round >= 4 && reactorNeed) {
+        nextSim = buildHeadlessStructure(nextSim, pi, "reactor", actor.botMemory?.hubPlan?.fallbackReactorTarget || getBotHub(actor));
+        actor = pi === 0 ? nextSim.p1 : nextSim.p2;
+      }
+    }
+
+    const panelTarget = Math.max(2, roverCount + (actor.habitats || []).length - ((actor.reactors || []).length * 2));
+    const expansionNeed = expansionPlan && getRechargeCoverageScore(actor, expansionPlan.habitatTarget) < 1.4;
+    if (expansionNeed && (actor.budget ?? 0) >= BASE_ASSET_COSTS.solar && (actor.panels || []).length < panelTarget) {
+      nextSim = tryBotPurchase(nextSim, pi, "solar", expansionPlan.solarTarget, { forceDirect: hasPlacementGrace(actor.arrivalDay, nextSim.globalDay) });
+      actor = pi === 0 ? nextSim.p1 : nextSim.p2;
+    }
+    if (expansionPlan && generatorCount > effectiveDemand && (actor.habitats || []).length < Math.max(2, Math.ceil(roverCount / 2)) && (actor.budget ?? 0) >= BASE_ASSET_COSTS.habitat && nextSim.round >= 3) {
+      const farFromHub = d2(expansionPlan.habitatTarget, getBotHub(actor)) > SAFETY_RADIUS.habitat * 0.7;
+      if (farFromHub) {
+        nextSim = tryBotPurchase(nextSim, pi, "habitat", expansionPlan.habitatTarget, { forceDirect: hasPlacementGrace(actor.arrivalDay, nextSim.globalDay) });
+        actor = pi === 0 ? nextSim.p1 : nextSim.p2;
+      }
+    }
+    if ((actor.landingPads || []).length < 2 && generatorCount > effectiveDemand && expansionPlan && (actor.budget ?? 0) >= BASE_ASSET_COSTS.pad && nextSim.round >= 3) {
+      const farPad = d2(expansionPlan.padTarget, getBotHub(actor)) > SAFETY_RADIUS.pad * 0.8;
+      if (farPad) {
+        nextSim = tryBotPurchase(nextSim, pi, "pad", expansionPlan.padTarget, { forceDirect: hasPlacementGrace(actor.arrivalDay, nextSim.globalDay) });
+        actor = pi === 0 ? nextSim.p1 : nextSim.p2;
+      }
+    }
+    if (generatorCount > effectiveDemand && (1 + (actor.extraRovers || []).length) < Math.min(4, (actor.habitats || []).length + 2) && (actor.budget ?? 0) >= BASE_ASSET_COSTS.rover && (((actor.reactors || []).length + actor.panels.length) > 0)) {
+      nextSim = buildHeadlessStructure(nextSim, pi, "rover", actor.base);
+      actor = pi === 0 ? nextSim.p1 : nextSim.p2;
+    }
+
+    const totalRovers = 1 + ((actor.extraRovers || []).length);
+    for (let roverIdx = 0; roverIdx < totalRovers; roverIdx++) {
+      actor = pi === 0 ? nextSim.p1 : nextSim.p2;
+      const rover = getRoverState(actor, roverIdx);
+      if (!rover) continue;
+      const roverPos = { x: rover.x, y: rover.y };
+      const roverPower = rover.power ?? actor.power ?? POWER_CAP;
+      const roverIce = rover.ice ?? actor.ice ?? 0;
+      const pendingPickup = getPendingPickupTarget(actor, roverPos);
+      const rechargeTargets = getAccessibleRechargeTargets(nextSim, pi);
+      const enemy = pi === 0 ? nextSim.p2 : nextSim.p1;
+      const sharedGridActive = nextSim.powerGridState.mode === "shared";
+      const inRechargeZone = pointInGeneratorCoverage(rechargeTargets, roverPos);
+      const nearestRecharge = rechargeTargets
+        .map(target => {
+          const hazard = getHostileZoneCountAtPoint(enemy, target, sharedGridActive);
+          const foreignPenalty = target.ownerId !== actor.id ? (roverPower < POWER_LOW * 0.35 ? 4 : 18) : 0;
+          const hazardPenalty = hazard * (roverPower < POWER_LOW * 0.35 ? 8 : 48);
+          const powerBias = target.kind === "reactor" ? -10 : 0;
+          return { ...target, score: d2(roverPos, target) + foreignPenalty + hazardPenalty + powerBias };
+        })
+        .sort((a, b) => a.score - b.score)[0];
+      const nearestRechargeDist = nearestRecharge ? d2(roverPos, nearestRecharge) : Infinity;
+      const rechargeReserve = nearestRecharge ? estimateTravelPowerCost(nearestRechargeDist, roverIce, !!rover.carrying) + 14 : POWER_LOW * 2.2;
+      const departureFloor = Math.max(POWER_CAP * 0.82, rechargeReserve + 16);
+      if (rover.carrying?.target) {
+        nextSim = updateSimPlayer(nextSim, pi, p => setRoverWaypointForPlayer(p, roverIdx, rover.carrying.target));
+        continue;
+      }
+      if (inRechargeZone && roverPower < departureFloor) {
+        nextSim = updateSimPlayer(nextSim, pi, p => setRoverWaypointForPlayer(p, roverIdx, nearestRecharge || roverPos));
+        continue;
+      }
+      if (pendingPickup && roverIce <= ICE_CAP * 0.05 && roverPower > rechargeReserve * 1.1) {
+        nextSim = updateSimPlayer(nextSim, pi, p => setRoverWaypointForPlayer(p, roverIdx, pendingPickup));
+        continue;
+      }
+      if (nearestRecharge && roverPower <= rechargeReserve) {
+        nextSim = updateSimPlayer(nextSim, pi, p => setRoverWaypointForPlayer(p, roverIdx, nearestRecharge));
+        continue;
+      }
+      if (roverIce > ICE_CAP * 0.3 && actor.habitats?.length) {
+        nextSim = updateSimPlayer(nextSim, pi, p => setRoverWaypointForPlayer(p, roverIdx, getBotHub(p)));
+        continue;
+      }
+      if (roverPower < Math.max(POWER_LOW * 1.6, 38) && nearestRecharge) {
+        nextSim = updateSimPlayer(nextSim, pi, p => setRoverWaypointForPlayer(p, roverIdx, nearestRecharge));
+        continue;
+      }
+      const ranked = selectOperationalCraters(nextSim, actor, roverPos);
+      const targetCrater = CRATER_DATA[ranked[Math.min(roverIdx, Math.max(0, ranked.length - 1))]?.ci ?? actor.botMemory.homeCraterIdx];
+      if (targetCrater) {
+        const targetPoint = { x: targetCrater.cx, y: targetCrater.cy };
+        const toMine = estimateTravelPowerCost(d2(roverPos, targetPoint), roverIce, !!rover.carrying);
+        const toRechargeAfterMine = nearestRecharge ? estimateTravelPowerCost(d2(targetPoint, nearestRecharge), Math.min(ICE_CAP, roverIce + 40), false) : POWER_LOW * 2.5;
+        const projectedMineTrip = toMine + toRechargeAfterMine + 14;
+        if (nearestRecharge && roverPower <= projectedMineTrip) {
+          nextSim = updateSimPlayer(nextSim, pi, p => setRoverWaypointForPlayer(p, roverIdx, nearestRecharge));
+        } else {
+          nextSim = updateSimPlayer(nextSim, pi, p => setRoverWaypointForPlayer(p, roverIdx, targetPoint));
+        }
+      }
+    }
+
+    return nextSim;
+  }
+
+  function resolveHeadlessDay(sim) {
+    const keepReplayData = sim.keepReplayData !== false;
+    const sharedGridActive = sim.powerGridState.mode === "shared";
+    const [chargedP1, chargedP2] = allocateDailyPower([sim.p1, sim.p2], sim.globalDay, sharedGridActive);
+    const ch = new Float32Array(sim.craterHealth);
+    const [np1, _ch2, evs1] = stepPlayer(chargedP1, ch, sim.globalDay);
+    let np2 = sim.p2;
+    let ch3 = _ch2;
+    let evs2 = [];
+    if (sim.p2) {
+      [np2, ch3, evs2] = stepPlayer(chargedP2, ch, sim.globalDay);
+      for (let i = 0; i < ch3.length; i++) ch3[i] = Math.min(_ch2[i], ch3[i]);
+    }
+
+    const applyDecayToOwner = (owner, enemyPos, attackMil, defenseMil) => {
+      const sh = { ...owner.structureHealth };
+      const structTypes = [
+        { key: "panels", list: owner.panels, type: "solar" },
+        { key: "reactors", list: owner.reactors || [], type: "reactor" },
+        { key: "habitats", list: owner.habitats || [], type: "habitat" },
+        { key: "extraRovers", list: owner.extraRovers || [], type: "rover" },
+        { key: "landingPads", list: owner.landingPads || [], type: "pad" },
+      ];
+      const newSH = {};
+      let damageDone = 0;
+      const _PASSIVE_DECAY = physOverrides.PASSIVE_DECAY != null ? physOverrides.PASSIVE_DECAY : PASSIVE_DECAY;
+      const _HOSTILE_DECAY = physOverrides.HOSTILE_DECAY != null ? physOverrides.HOSTILE_DECAY : HOSTILE_DECAY;
+      const defMul = MIL_DEFENSE_SCALE + (1 - MIL_DEFENSE_SCALE) * (1 / Math.max(0.1, defenseMil));
+      const hostileDecayEff = _HOSTILE_DECAY * attackMil * defMul;
+      for (const { key, list, type } of structTypes) {
+        const healths = [...(sh[key] || list.map(() => 1.0))];
+        for (let idx = 0; idx < list.length; idx++) {
+          const struct = list[idx];
+          const radius = SAFETY_RADIUS[type];
+          const generatorSharedSafe = sharedGridActive && (type === "solar" || type === "reactor");
+          const inZone = !generatorSharedSafe && d2(enemyPos, struct) < radius;
+          const decay = inZone ? hostileDecayEff : _PASSIVE_DECAY;
+          if (inZone) damageDone += hostileDecayEff;
+          healths[idx] = Math.max(0, (healths[idx] ?? 1.0) - decay);
+        }
+        newSH[key] = healths;
+      }
+      return { updatedOwner: { ...owner, structureHealth: newSH }, damageDone };
+    };
+
+    const mil1 = np1.milScore ?? 1.0;
+    const mil2 = np2?.milScore ?? 1.0;
+    const { updatedOwner: dnp1, damageDone: dmgByP2 } = sim.p2
+      ? applyDecayToOwner(np1, { x: np2.x, y: np2.y }, mil2, mil1)
+      : { updatedOwner: np1, damageDone: 0 };
+    const { updatedOwner: dnp2, damageDone: dmgByP1 } = sim.p2
+      ? applyDecayToOwner(np2, { x: np1.x, y: np1.y }, mil1, mil2)
+      : { updatedOwner: np2, damageDone: 0 };
+    const diplomacyRecoveryEnabled = isPlayerActiveForDiplomacy(dnp1, sim.globalDay) && isPlayerActiveForDiplomacy(dnp2, sim.globalDay);
+    const passiveGain = diplomacyRecoveryEnabled ? 0.5 : 0;
+    let fnp1 = {
+      ...dnp1,
+      diplomacy: Math.min(100, Math.max(-100, (dnp1.diplomacy ?? 0) + passiveGain - dmgByP1 * 80)),
+    };
+    let fnp2 = dnp2 ? {
+      ...dnp2,
+      diplomacy: Math.min(100, Math.max(-100, (dnp2.diplomacy ?? 0) + passiveGain - dmgByP2 * 80)),
+    } : null;
+
+    if (sim.p2) {
+      const p1ReactorPlacements = evs1.filter(ev => ev.type === "place" && ev.itemType === "reactor");
+      const p2ReactorPlacements = evs2.filter(ev => ev.type === "place" && ev.itemType === "reactor");
+      for (const ev of p1ReactorPlacements) fnp1 = applyPureReactorPlacementPenalty(fnp1, fnp2, ev.x, ev.y);
+      for (const ev of p2ReactorPlacements) fnp2 = applyPureReactorPlacementPenalty(fnp2, fnp1, ev.x, ev.y);
+    }
+
+    const events = [...evs1, ...evs2];
+    const mined1 = evs1.filter(e => e.type === "mine").map(e => e.craterIdx);
+    const mined2 = evs2.filter(e => e.type === "mine").map(e => e.craterIdx);
+    const contestedToday = mined1.some(ci => mined2.includes(ci));
+    const missionLog = keepReplayData
+      ? [
+          ...(sim.missionLog || []),
+          ...events.map(ev => ({ round: sim.round, day: sim.day, globalDay: sim.globalDay, type: ev.type, kg: ev.kg, craterIdx: ev.craterIdx, itemType: ev.itemType })),
+        ]
+      : (sim.missionLog || []);
+
+    const newGlobalDay = sim.globalDay + 1;
+    const newDay = sim.day + 1;
+    let newRound = sim.round;
+    let newCR = [...sim.claimR];
+    let roundEnded = false;
+    let history = keepReplayData ? [...(sim.history || [])] : (sim.history || []);
+    let efnp1 = null, efnp2 = null;
+
+    if (newDay >= DAYS_PER_ROUND) {
+      const dep1 = evs1.filter(e => e.type === "deposit").reduce((s, e) => s + e.kg, 0);
+      const dep2 = evs2.filter(e => e.type === "deposit").reduce((s, e) => s + e.kg, 0);
+      newCR[0] = Math.min(220, newCR[0] + Math.min(18, dep1 / 18));
+      if (sim.p2) newCR[1] = Math.min(220, newCR[1] + Math.min(18, dep2 / 18));
+
+      const E1 = fnp1.econ ?? E_INIT, E2 = fnp2?.econ ?? E_INIT;
+      const T1 = fnp1.assetPts ?? 0, T2 = fnp2?.assetPts ?? 0;
+      const M1 = fnp1.milStock ?? 1, M2 = fnp2?.milStock ?? 1;
+      const E_max = Math.max(E1, E2), T_max = Math.max(T1, T2), M_max = Math.max(M1, M2);
+      const processEconomy = (p, E, T, M) => {
+        if (p.active === false) return p;
+        const alloc = p.alloc || { mil:15, rd:15, econ:50, budget:20 };
+        const totalPct = (alloc.mil + alloc.rd + alloc.econ + (alloc.budget || 0)) || 1;
+        const I_E = alloc.econ / totalPct;
+        const I_R = alloc.rd / totalPct;
+        const I_M = alloc.mil / totalPct;
+        const I_B = (alloc.budget || 0) / totalPct;
+        const C = calcCompetitiveness(E, T, M, E_max, T_max, M_max);
+        const bonusCredits = Math.round(I_B * (p.budget ?? 0));
+        const newE = Math.max(0.5, E + calcDeltaE(I_E, C, p.rdAccum ?? 0));
+        const newR = Math.max(0, (p.rdAccum ?? 0) + calcDeltaR(I_R, C));
+        const newM = Math.max(0.1, M + calcDeltaM(I_M, M));
+        const newBudget = Math.max(0, calcBudget(newE) + bonusCredits);
+        return { ...p, econ: newE, rdAccum: newR, milStock: newM, milScore: calcMilScore(newM), budget: newBudget };
+      };
+      efnp1 = processEconomy(fnp1, E1, T1, M1);
+      efnp2 = sim.p2 ? processEconomy(fnp2, E2, T2, M2) : null;
+      if (keepReplayData) {
+        history = [...history, {
+          r: sim.round,
+          d1: Math.round(efnp1.iceDeposited),
+          d2: Math.round(efnp2?.iceDeposited ?? 0),
+          dep1: Math.round(dep1),
+          dep2: Math.round(dep2),
+          bud1: Math.round(efnp1.budget),
+          bud2: Math.round(efnp2?.budget ?? 0),
+        }];
+      }
+      newRound = sim.round + 1;
+      roundEnded = true;
+    }
+
+    const batchFlags = {
+      ...(sim.batchFlags || {}),
+      sharedDays: (sim.batchFlags?.sharedDays || 0) + (sharedGridActive ? 1 : 0),
+      contestedDays: (sim.batchFlags?.contestedDays || 0) + (contestedToday ? 1 : 0),
+    };
+
+    const depletedOut = isMapDepleted(ch3);
+    const fixedOut = sim.missionEndMode === "fixed" && roundEnded && newRound > sim.totalRounds;
+    const nextPhase = fixedOut || depletedOut ? PHASE.DONE : PHASE.PLAYING;
+    return {
+      ...sim,
+      p1: roundEnded ? efnp1 : fnp1,
+      p2: sim.p2 ? (roundEnded ? efnp2 : fnp2) : null,
+      craterHealth: ch3,
+      claimR: newCR,
+      round: roundEnded ? Math.min(newRound, sim.totalRounds) : sim.round,
+      day: roundEnded ? 0 : newDay,
+      globalDay: newGlobalDay,
+      phase: nextPhase,
+      missionLog,
+      lastEvents: keepReplayData ? events : [],
+      history,
+      batchFlags,
+    };
+  }
+
+  function simulateBotGame(config, seed, opts = {}) {
+    const storeReplay = opts.storeReplay !== false;
+    const rng = makeSeededRng(seed);
+    const p1Crater = chooseStartCrater(null, rng);
+    const p1Base = chooseBasePositionForCrater(p1Crater, rng);
+    let sim = {
+      phase: PHASE.PLAYING,
+      keepReplayData: storeReplay,
+      totalRounds: config.totalRounds,
+      missionEndMode: config.missionEndMode,
+      allowGridSharing: config.gridSharingEnabled,
+      permanentGridSharing: config.gridSharingPermanent,
+      p1: makePlayer(p1Base, 1, "#ffdc00"),
+      p2: config.scenarioPreset === "unevenArrival" ? null : makePlayer(chooseBasePositionForCrater(chooseStartCrater(p1Base, rng), rng), 2, "#b000ff"),
+      craterHealth: new Float32Array(CRATER_DATA.length).fill(1.0),
+      round: 1,
+      day: 0,
+      globalDay: 0,
+      history: [],
+      missionLog: [],
+      lastEvents: [],
+      claimR: [80, 80],
+      powerGridState: { mode:"independent", offeredBy:null, offeredTo:null },
+      batchFlags: { offers:0, joins:0, decouples:0, sharedDays:0, contestedDays:0 },
+      nextId: 1,
+    };
+    const frames = storeReplay ? [snapshotSimState(sim)] : null;
+    const maxDays = config.missionEndMode === "depletion" ? 2500 : config.totalRounds * DAYS_PER_ROUND + 2;
+
+    while (sim.phase !== PHASE.DONE && sim.globalDay < maxDays) {
+      if (config.scenarioPreset === "unevenArrival" && !sim.p2 && sim.globalDay >= config.arrivalDelay) {
+        const p2Crater = chooseStartCrater(sim.p1?.base, rng);
+        const p2Base = chooseBasePositionForCrater(p2Crater, rng);
+        sim = {
+          ...sim,
+          p2: makePlayer(p2Base, 2, "#b000ff", { arrivalDay: config.arrivalDelay }),
+          missionLog: storeReplay ? [...sim.missionLog, { round:sim.round, day:sim.day, globalDay:sim.globalDay, type:"arrival", label:"P2 arrived and established a base" }] : sim.missionLog,
+        };
+        if (storeReplay) frames.push(snapshotSimState(sim));
+      }
+      sim = planBotTurn(sim, 0, rng);
+      sim = planBotTurn(sim, 1, rng);
+      sim = resolveHeadlessDay(sim);
+      if (storeReplay) frames.push(snapshotSimState(sim));
+    }
+
+    const score1 = scorePlayerState(sim.p1);
+    const score2 = scorePlayerState(sim.p2);
+    const totalMapIce = getTotalMapIce(config.physOverrides);
+    const totalExtracted = CRATER_DATA.reduce((sum, crater, ci) => {
+      const remaining = sim.craterHealth[ci] ?? 1;
+      return sum + (1 - remaining) * getCraterIceCapacity(crater, config.physOverrides?.DEPLETION_RATE);
+    }, 0);
+    return {
+      seed,
+      config,
+      frames: frames || undefined,
+      missionLog: storeReplay ? [...sim.missionLog] : undefined,
+      summary: {
+        winner: score1 > score2 ? 1 : score2 > score1 ? 2 : 0,
+        score1, score2,
+        ice1: sim.p1?.iceDeposited ?? 0,
+        ice2: sim.p2?.iceDeposited ?? 0,
+        dip1: sim.p1?.diplomacy ?? 0,
+        dip2: sim.p2?.diplomacy ?? 0,
+        ap1: sim.p1?.assetPts ?? 0,
+        ap2: sim.p2?.assetPts ?? 0,
+        counts1: structureCounts(sim.p1),
+        counts2: structureCounts(sim.p2),
+        offers: sim.batchFlags.offers || 0,
+        joins: sim.batchFlags.joins || 0,
+        decouples: sim.batchFlags.decouples || 0,
+        sharedDays: sim.batchFlags.sharedDays || 0,
+        contestedDays: sim.batchFlags.contestedDays || 0,
+        cratersDepleted: CRATER_DATA.filter((_, ci) => (sim.craterHealth[ci] ?? 1) < 0.2).length,
+        durationDays: sim.globalDay,
+        totalExtracted,
+        totalMapIce,
+        extractedPct: totalExtracted / Math.max(1, totalMapIce),
+      },
+    };
+  }
+
+  function summarizeBatchRuns(config, runs) {
+    const avg = fn => runs.reduce((sum, run) => sum + fn(run), 0) / Math.max(1, runs.length);
+    const p1Wins = runs.filter(r => r.summary.winner === 1).length;
+    const p2Wins = runs.filter(r => r.summary.winner === 2).length;
+    const draws = runs.length - p1Wins - p2Wins;
+    return {
+      config,
+      runs: runs.map(run => ({ seed:run.seed, config:run.config, summary:run.summary })),
+      totalRuns: runs.length,
+      p1WinRate: p1Wins / Math.max(1, runs.length),
+      p2WinRate: p2Wins / Math.max(1, runs.length),
+      drawRate: draws / Math.max(1, runs.length),
+      avgScore1: avg(r => r.summary.score1),
+      avgScore2: avg(r => r.summary.score2),
+      avgIce1: avg(r => r.summary.ice1),
+      avgIce2: avg(r => r.summary.ice2),
+      avgDip1: avg(r => r.summary.dip1),
+      avgDip2: avg(r => r.summary.dip2),
+      avgAp1: avg(r => r.summary.ap1),
+      avgAp2: avg(r => r.summary.ap2),
+      avgDepleted: avg(r => r.summary.cratersDepleted),
+      avgSharedDays: avg(r => r.summary.sharedDays),
+      avgContestedDays: avg(r => r.summary.contestedDays),
+      avgExtracted: avg(r => r.summary.totalExtracted),
+      avgExtractedPct: avg(r => r.summary.extractedPct),
+      totalMapIce: runs[0]?.summary.totalMapIce ?? getTotalMapIce(config.physOverrides),
+      offerRate: runs.filter(r => r.summary.offers > 0).length / Math.max(1, runs.length),
+      joinRate: runs.filter(r => r.summary.joins > 0).length / Math.max(1, runs.length),
+      decoupleRate: runs.filter(r => r.summary.decouples > 0).length / Math.max(1, runs.length),
+    };
+  }
+
+  function loadReplayFrame(run, frameIdx) {
+    const frame = run?.frames?.[frameIdx];
+    if (!frame) return;
+    setReplayFrameIndex(frameIdx);
+    setP1(clonePlayerState(frame.p1));
+    setP2(clonePlayerState(frame.p2));
+    setCraterHealth(new Float32Array(frame.craterHealth));
+    setRound(frame.round);
+    setDay(frame.day);
+    setGlobalDay(frame.globalDay);
+    setClaimR([...frame.claimR]);
+    setPowerGridState({ ...frame.powerGridState });
+    setHistory(frame.history.map(h => ({ ...h })));
+    setLastEvents([]);
+    setMissionLog(run.missionLog.slice(0, frame.logLength).map(ev => ({ ...ev })));
+    setPhase(frame.phase === PHASE.DONE ? PHASE.DONE : PHASE.PLAYING);
+  }
+
+  async function watchReplayRun(run) {
+    if (!run) return;
+    setUndoStack([]);
+    setReplayLoading(true);
+    setReplayPlaying(false);
+    setSimMode("analysis");
+    setScenarioPreset(run.config?.scenarioPreset || "standard");
+    setTotalRounds(run.config?.totalRounds || 12);
+    setMissionEndMode(run.config?.missionEndMode || "fixed");
+    setArrivalDelay(run.config?.arrivalDelay || 5);
+    setGridSharingEnabled(run.config?.gridSharingEnabled ?? true);
+    setGridSharingPermanent(run.config?.gridSharingPermanent ?? false);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    const replayData = run.frames ? run : simulateBotGame(run.config, run.seed, { storeReplay:true });
+    setReplayRun(replayData);
+    loadReplayFrame(replayData, 0);
+    setReplayLoading(false);
+  }
+
+  function exitReplay() {
+    setReplayPlaying(false);
+    setReplayRun(null);
+    setReplayFrameIndex(0);
+    setPhase(PHASE.BATCH);
+  }
+
+  async function startBatchRunner() {
+    const config = {
+      scenarioPreset,
+      totalRounds,
+      missionEndMode,
+      arrivalDelay,
+      gridSharingEnabled,
+      gridSharingPermanent,
+      physOverrides: { ...physOverrides },
+      runCount: batchRunCount,
+    };
+    setBatchRunning(true);
+    setUndoStack([]);
+    setBatchResult(null);
+    setBatchProgress({ completed:0, total:batchRunCount, currentSeed:null });
+    setReplayRun(null);
+    setReplayPlaying(false);
+    setPhase(PHASE.BATCH);
+    const baseSeed = Date.now() & 0xffffffff;
+    const runs = [];
+    for (let i = 0; i < batchRunCount; i++) {
+      const seed = (baseSeed + i * 9973) >>> 0;
+      setBatchProgress({ completed:i, total:batchRunCount, currentSeed:seed });
+      runs.push(simulateBotGame(config, seed));
+      if (i % 2 === 0) await new Promise(resolve => setTimeout(resolve, 0));
+    }
+    const summary = summarizeBatchRuns(config, runs);
+    setBatchProgress({ completed:batchRunCount, total:batchRunCount, currentSeed:null });
+    setBatchResult(summary);
+    setBatchRunning(false);
+  }
 
   const Bar = ({ val, max, color, h=4 }) => {
     const pct = clamp((val/max)*100,0,100);
@@ -1754,6 +3395,9 @@ export default function App() {
   const score2 = totalIce2 * PTS_PER_KG + ap2 * PTS_PER_AP + dip2 * PTS_PER_DIP;
   const winner = phase===PHASE.DONE ? (score1>score2?1:score2>score1?2:0) : null;
   const share1 = score1 / (score1+score2||1);
+  const replayActive = !!replayRun;
+  const durationSummaryLabel = missionEndMode === "depletion" ? "UNTIL DEPLETION" : `${totalRounds} ROUNDS · ${totalRounds * DAYS_PER_ROUND} DAYS`;
+  const roundCounterLabel = missionEndMode === "depletion" ? `R${round} · D${day+1}/${DAYS_PER_ROUND}` : `R${round}/${totalRounds} · D${day+1}/${DAYS_PER_ROUND}`;
 
   // ── Settings screen ──────────────────────────────────────────────────────
   if (phase===PHASE.SETTINGS) return (
@@ -1811,7 +3455,7 @@ export default function App() {
             {[
               ["competitive","⚔ COMPETITIVE","Two players compete for PSR ice"],
               ["solo","👤 SOLO","You control P1; P2 auto-mines in place"],
-              ["analysis","⚙ AUTO-SIM","Both sides auto-advance; watch and analyze"],
+              ["analysis","⚙ BATCH RUNNER","Run 100 bot matches and compare outcomes"],
             ].map(([m,label,tip]) => (
               <button key={m} onClick={()=>setSimMode(m)} title={tip} style={{
                 flex:1, background:simMode===m?"rgba(0,180,255,0.15)":"rgba(255,255,255,0.03)",
@@ -1834,19 +3478,23 @@ export default function App() {
               { id:"standard", label:"STANDARD MISSION", desc:"Default parameters · 12 rounds · balanced economy", rounds:12 },
               { id:"longhaul",  label:"LONG-HAUL EXTRACTION", desc:"20 rounds · test crater depletion dynamics", rounds:20 },
               { id:"sprint",    label:"SPRINT ACQUISITION", desc:"4 rounds · first-mover advantage focus", rounds:4 },
+              { id:"unevenArrival", label:"UNEVEN ARRIVAL", desc:"20 rounds · delayed Player 2 arrival", rounds:20 },
               { id:"nocombat",  label:"COOPERATIVE MODE", desc:"Military disabled · pure ISRU optimization", rounds:12, overrides:{ HOSTILE_DECAY:0, MIL_DAMAGE_SCALE:0 } },
             ].map(scen => (
               <button key={scen.id} onClick={()=>{
+                setScenarioPreset(scen.id);
                 setTotalRounds(scen.rounds);
+                setMissionEndMode("fixed");
                 if (scen.overrides) setPhysOverrides(scen.overrides);
                 else setPhysOverrides({});
               }} style={{
-                background:"rgba(255,255,255,0.02)", border:"1px solid rgba(255,255,255,0.06)",
+                background:scenarioPreset===scen.id?"rgba(0,180,255,0.1)":"rgba(255,255,255,0.02)",
+                border:`1px solid ${scenarioPreset===scen.id?"rgba(0,180,255,0.3)":"rgba(255,255,255,0.06)"}`,
                 borderRadius:5, padding:"7px 10px", cursor:"pointer", textAlign:"left",
                 display:"flex", justifyContent:"space-between", alignItems:"center",
               }}>
                 <span>
-                  <div style={{fontSize:8,color:"#6a8fa8",letterSpacing:"0.1em",fontFamily:"'Orbitron',monospace"}}>{scen.label}</div>
+                  <div style={{fontSize:8,color:scenarioPreset===scen.id?"#8fd0ff":"#6a8fa8",letterSpacing:"0.1em",fontFamily:"'Orbitron',monospace"}}>{scen.label}</div>
                   <div style={{fontSize:6.5,color:"#2a4050",marginTop:2,fontFamily:"'JetBrains Mono',monospace"}}>{scen.desc}</div>
                 </span>
                 <span style={{fontSize:9,color:"#1e3040"}}>→</span>
@@ -1859,25 +3507,114 @@ export default function App() {
           <div style={{ display:"flex", justifyContent:"space-between", marginBottom:8 }}>
             <span style={{ fontSize:9, color:"#6a8fa8", letterSpacing:"0.1em" }}>MISSION DURATION</span>
             <span style={{ fontSize:14, fontWeight:700, color:"#ffd700",
-              fontFamily:"'Orbitron',monospace" }}>{totalRounds} RND · {totalRounds*DAYS_PER_ROUND} DAYS</span>
+              fontFamily:"'Orbitron',monospace" }}>
+              {missionEndMode === "depletion" ? "VERY LONG · UNTIL DEPLETION" : `${totalRounds} RND · ${totalRounds*DAYS_PER_ROUND} DAYS`}
+            </span>
           </div>
-          <div style={{ position:"relative" }}>
-            <input type="range" min={4} max={20} value={totalRounds}
-              onChange={e=>setTotalRounds(+e.target.value)}
-              style={{ width:"100%", accentColor:"#ffd700", cursor:"pointer" }} />
-          </div>
+          {missionEndMode === "fixed" && (
+            <div style={{ position:"relative" }}>
+              <input type="range" min={4} max={20} value={totalRounds}
+                onChange={e=>setTotalRounds(+e.target.value)}
+                style={{ width:"100%", accentColor:"#ffd700", cursor:"pointer" }} />
+            </div>
+          )}
           <div style={{ display:"flex", gap:5, marginTop:8 }}>
-            {[[4,"QUICK"],[8,"SHORT"],[12,"STANDARD"],[20,"LONG"]].map(([v,l]) => (
-              <button key={v} onClick={()=>setTotalRounds(v)} style={{
-                flex:1, background:totalRounds===v?"rgba(255,215,0,0.12)":"rgba(255,255,255,0.03)",
-                border:`1px solid ${totalRounds===v?"#ffd70055":"rgba(255,255,255,0.06)"}`,
-                color:totalRounds===v?"#ffd700":"#2a4050", borderRadius:4, padding:"5px 0",
+            {[[4,"QUICK","fixed"],[8,"SHORT","fixed"],[12,"STANDARD","fixed"],[20,"LONG","fixed"],["depletion","VERY LONG","depletion"]].map(([v,l,mode]) => (
+              <button key={l} onClick={()=>{
+                if (mode === "depletion") setMissionEndMode("depletion");
+                else {
+                  setMissionEndMode("fixed");
+                  setTotalRounds(v);
+                }
+              }} style={{
+                flex:1, background:(mode==="depletion" ? missionEndMode==="depletion" : missionEndMode==="fixed" && totalRounds===v)?"rgba(255,215,0,0.12)":"rgba(255,255,255,0.03)",
+                border:`1px solid ${(mode==="depletion" ? missionEndMode==="depletion" : missionEndMode==="fixed" && totalRounds===v)?"#ffd70055":"rgba(255,255,255,0.06)"}`,
+                color:(mode==="depletion" ? missionEndMode==="depletion" : missionEndMode==="fixed" && totalRounds===v)?"#ffd700":"#2a4050", borderRadius:4, padding:"5px 0",
                 cursor:"pointer", fontSize:7, fontFamily:"'Orbitron','Courier New',monospace",
                 letterSpacing:"0.08em",
               }}>{l}</button>
             ))}
           </div>
+          {scenarioPreset === "unevenArrival" && (
+            <div style={{ marginTop:12 }}>
+              <div style={{ display:"flex", justifyContent:"space-between", marginBottom:8 }}>
+                <span style={{ fontSize:9, color:"#6a8fa8", letterSpacing:"0.1em" }}>ARRIVAL DELAY</span>
+                <span style={{ fontSize:12, fontWeight:700, color:"#44aaff",
+                  fontFamily:"'Orbitron',monospace" }}>{arrivalDelay} DAY{arrivalDelay!==1?"S":""}</span>
+              </div>
+              <div style={{ position:"relative" }}>
+                <input type="range" min={1} max={90} value={arrivalDelay}
+                  onChange={e=>setArrivalDelay(+e.target.value)}
+                  style={{ width:"100%", accentColor:"#44aaff", cursor:"pointer" }} />
+              </div>
+            </div>
+          )}
         </div>
+
+        <div style={{ marginBottom:20 }}>
+          <div style={{ fontSize:7, letterSpacing:"0.25em", color:"#2a4050", marginBottom:8,
+            fontFamily:"'Orbitron',monospace" }}>GRID DIPLOMACY</div>
+          <div style={{ display:"flex", gap:6, marginBottom:8 }}>
+            {[
+              ["enabled", "SHARING ENABLED", "Offers and joins may occur"],
+              ["disabled", "SHARING DISABLED", "Power grids remain isolated"],
+            ].map(([mode, label, tip]) => (
+              <button key={mode} onClick={()=>setGridSharingEnabled(mode==="enabled")} style={{
+                flex:1, background:(gridSharingEnabled === (mode==="enabled"))?"rgba(0,180,255,0.12)":"rgba(255,255,255,0.03)",
+                border:`1px solid ${(gridSharingEnabled === (mode==="enabled"))?"rgba(0,180,255,0.35)":"rgba(255,255,255,0.06)"}`,
+                color:(gridSharingEnabled === (mode==="enabled"))?"#44aaff":"#2a4050", borderRadius:5, padding:"7px 6px",
+                cursor:"pointer", fontSize:6.5, fontFamily:"'Orbitron','Courier New',monospace", lineHeight:1.5,
+              }}>{label}<br/><span style={{opacity:0.55,fontSize:5.5,fontFamily:"'JetBrains Mono',monospace"}}>{tip}</span></button>
+            ))}
+          </div>
+          {gridSharingEnabled && (
+            <div style={{ display:"flex", gap:6 }}>
+              {[
+                [false, "REVERSIBLE", "Either player may later decouple"],
+                [true, "PERMANENT", "Shared grid cannot be decoupled"],
+              ].map(([perm, label, tip]) => (
+                <button key={label} onClick={()=>setGridSharingPermanent(perm)} style={{
+                  flex:1, background:gridSharingPermanent===perm?"rgba(255,215,0,0.12)":"rgba(255,255,255,0.03)",
+                  border:`1px solid ${gridSharingPermanent===perm?"rgba(255,215,0,0.35)":"rgba(255,255,255,0.06)"}`,
+                  color:gridSharingPermanent===perm?"#ffd700":"#2a4050", borderRadius:5, padding:"7px 6px",
+                  cursor:"pointer", fontSize:6.5, fontFamily:"'Orbitron','Courier New',monospace", lineHeight:1.5,
+                }}>{label}<br/><span style={{opacity:0.55,fontSize:5.5,fontFamily:"'JetBrains Mono',monospace"}}>{tip}</span></button>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {simMode === "analysis" && (
+          <div style={{ marginBottom:20 }}>
+            <div style={{ display:"flex", justifyContent:"space-between", marginBottom:8 }}>
+              <span style={{ fontSize:9, color:"#6a8fa8", letterSpacing:"0.1em" }}>MONTE CARLO RUNS</span>
+              <span style={{ fontSize:12, fontWeight:700, color:"#44aaff",
+                fontFamily:"'Orbitron',monospace" }}>{batchRunCount} RUN{batchRunCount!==1?"S":""}</span>
+            </div>
+            <div style={{ position:"relative" }}>
+              <input
+                type="range"
+                min={1}
+                max={500}
+                step={1}
+                value={batchRunCount}
+                onChange={e=>setBatchRunCount(+e.target.value)}
+                style={{ width:"100%", accentColor:"#44aaff", cursor:"pointer" }}
+              />
+            </div>
+            <div style={{ display:"flex", gap:5, marginTop:8 }}>
+              {[1, 10, 25, 50, 100, 250].map(v => (
+                <button key={v} onClick={()=>setBatchRunCount(v)} style={{
+                  flex:1, background:batchRunCount===v?"rgba(68,170,255,0.12)":"rgba(255,255,255,0.03)",
+                  border:`1px solid ${batchRunCount===v?"rgba(68,170,255,0.35)":"rgba(255,255,255,0.06)"}`,
+                  color:batchRunCount===v?"#44aaff":"#2a4050", borderRadius:4, padding:"5px 0",
+                  cursor:"pointer", fontSize:7, fontFamily:"'Orbitron','Courier New',monospace",
+                  letterSpacing:"0.08em",
+                }}>{v}</button>
+              ))}
+            </div>
+          </div>
+        )}
 
         <div style={{ marginBottom:24 }}>
           <div style={{ fontSize:8, letterSpacing:"0.3em", color:"#2a4050", marginBottom:10,
@@ -1901,13 +3638,30 @@ export default function App() {
         }}>
           <div style={{ color:"#4a8099", marginBottom:6, letterSpacing:"0.15em", fontSize:9,
             fontFamily:"'Orbitron',monospace" }}>MISSION BRIEFING</div>
-          <div>① <span style={{color:"#ffd700"}}>P1</span> plans action → click <strong style={{color:"#ffd700"}}>END TURN</strong></div>
-          <div>② <span style={{color:"#b000ff"}}>P2</span> plans action → click <strong style={{color:"#b000ff"}}>END TURN</strong></div>
-          <div>③ Both turns resolve simultaneously</div>
-          <div>④ Repeat until mission end. Extract the most ice!</div>
+          {simMode === "analysis" ? (
+            <>
+              <div>1. Launch a seeded batch of bot-vs-bot missions under the current ruleset.</div>
+              <div>2. Watch the circular progress indicator fill as runs complete in the background.</div>
+              <div>3. Review win rates, ice output, diplomacy, and shared-grid outcomes afterward.</div>
+              <div>4. Open any stored run and replay it in the browser UI day by day.</div>
+            </>
+          ) : (
+            <>
+              <div>1. <span style={{color:"#ffd700"}}>P1</span> plans action, then clicks <strong style={{color:"#ffd700"}}>END TURN</strong>.</div>
+              <div>2. <span style={{color:"#b000ff"}}>P2</span> plans action, then clicks <strong style={{color:"#b000ff"}}>END TURN</strong>.</div>
+              <div>3. Both turns resolve simultaneously.</div>
+              <div>4. Repeat until mission end. Extract the most ice.</div>
+            </>
+          )}
         </div>
 
-        <button onClick={()=>setPhase(PHASE.SETUP1)} style={{
+        <button onClick={()=>{
+          if (simMode==="analysis") startBatchRunner();
+          else {
+            setUndoStack([]);
+            setPhase(PHASE.SETUP1);
+          }
+        }} style={{
           width:"100%", background:"rgba(255,215,0,0.08)",
           border:"1px solid rgba(255,215,0,0.35)",
           color:"#ffd700", borderRadius:7, padding:"14px 0", cursor:"pointer",
@@ -1915,13 +3669,150 @@ export default function App() {
           fontWeight:700, position:"relative", overflow:"hidden",
           boxShadow:"0 0 20px rgba(255,215,0,0.1)",
         }}>
-          ▶ DEPLOY MISSION
+          {simMode==="analysis" ? "RUN BATCH" : "DEPLOY MISSION"}
         </button>
       </div>
     </div>
   );
 
   // ── Main HUD ─────────────────────────────────────────────────────────────
+  if (phase===PHASE.BATCH) {
+    const pct = Math.round((batchProgress.completed / Math.max(1, batchProgress.total)) * 100);
+    const bestRun = batchResult?.runs?.slice().sort((a, b) => Math.abs(b.summary.score1 - b.summary.score2) - Math.abs(a.summary.score1 - a.summary.score2))[0];
+    return (
+      <div style={{
+        minHeight:"100vh",
+        background:"radial-gradient(ellipse at 35% 25%, #06101e 0%, #020810 55%, #030c18 100%)",
+        fontFamily:"'JetBrains Mono','Courier New',monospace", color:"#9bbcd4",
+        display:"flex", flexDirection:"column", alignItems:"center", padding:"28px 20px",
+      }}>
+        <div style={{ width:"100%", maxWidth:760, display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:18 }}>
+          <div>
+            <div style={{ fontSize:8, letterSpacing:"0.45em", color:"#2a4a60", fontFamily:"'Orbitron',monospace" }}>BATCH RUNNER</div>
+            <div style={{ fontSize:18, color:"#d7e8f6", letterSpacing:"0.08em", fontFamily:"'Orbitron',monospace", marginTop:6 }}>
+              {batchRunning ? "Running Monte Carlo Batch" : "Batch Results"}
+            </div>
+          </div>
+          <button onClick={()=>!batchRunning && !replayLoading && setPhase(PHASE.SETTINGS)} disabled={batchRunning || replayLoading} style={{
+            background:"rgba(255,255,255,0.03)", border:"1px solid rgba(255,255,255,0.08)",
+            color:(batchRunning || replayLoading)?"#243848":"#6a8fa8", borderRadius:6, padding:"7px 12px", cursor:(batchRunning || replayLoading)?"default":"pointer",
+            fontSize:7, letterSpacing:"0.1em", fontFamily:"'JetBrains Mono',monospace",
+          }}>BACK</button>
+        </div>
+
+        {batchRunning ? (
+          <div style={{ width:"100%", maxWidth:520, background:"rgba(4,9,20,0.96)", border:"1px solid rgba(255,255,255,0.09)",
+            borderRadius:12, padding:"32px 28px", textAlign:"center", boxShadow:"0 0 40px rgba(0,100,200,0.08)" }}>
+            <div style={{
+              width:180, height:180, margin:"0 auto 22px", borderRadius:"50%",
+              background:`conic-gradient(#44aaff ${pct}%, rgba(255,255,255,0.06) 0%)`,
+              display:"grid", placeItems:"center", boxShadow:"0 0 30px rgba(68,170,255,0.15)"
+            }}>
+              <div style={{
+                width:136, height:136, borderRadius:"50%", background:"rgba(3,8,18,0.95)",
+                border:"1px solid rgba(255,255,255,0.05)", display:"flex", flexDirection:"column",
+                alignItems:"center", justifyContent:"center"
+              }}>
+                <div style={{ fontSize:28, color:"#44aaff", fontFamily:"'Orbitron',monospace" }}>{pct}%</div>
+                <div style={{ fontSize:7, color:"#3a6080", letterSpacing:"0.12em" }}>
+                  {batchProgress.completed}/{batchProgress.total} RUNS
+                </div>
+              </div>
+            </div>
+            <div style={{ fontSize:9, color:"#7fb8de", letterSpacing:"0.1em", fontFamily:"'Orbitron',monospace", marginBottom:8 }}>
+              SIMULATING STRATEGIC BOT MATCHES
+            </div>
+            <div style={{ fontSize:7, color:"#3a5570", lineHeight:1.8 }}>
+              Ruleset: {scenarioPreset.toUpperCase()} · {missionEndMode === "depletion" ? "until depletion" : `${totalRounds} rounds · ${totalRounds * DAYS_PER_ROUND} days`}
+              {scenarioPreset === "unevenArrival" && <> · P2 delay {arrivalDelay}d</>}
+              {gridSharingEnabled ? ` · sharing ${gridSharingPermanent ? "permanent" : "reversible"}` : " · sharing disabled"}
+            </div>
+            {batchProgress.currentSeed != null && (
+              <div style={{ marginTop:10, fontSize:6.5, color:"#2a4a60" }}>
+                Current seed {batchProgress.currentSeed}
+              </div>
+            )}
+          </div>
+        ) : replayLoading ? (
+          <div style={{ width:"100%", maxWidth:520, background:"rgba(4,9,20,0.96)", border:"1px solid rgba(255,255,255,0.09)",
+            borderRadius:12, padding:"32px 28px", textAlign:"center", boxShadow:"0 0 40px rgba(0,100,200,0.08)" }}>
+            <div style={{ width:26, height:26, margin:"0 auto 14px", borderRadius:"50%", border:"2px solid rgba(68,170,255,0.25)",
+              borderTopColor:"#44aaff", animation:"spin 1s linear infinite" }} />
+            <div style={{ fontSize:9, color:"#7fb8de", letterSpacing:"0.1em", fontFamily:"'Orbitron',monospace", marginBottom:8 }}>
+              REBUILDING REPLAY
+            </div>
+            <div style={{ fontSize:7, color:"#3a5570", lineHeight:1.8 }}>
+              Re-simulating the selected run from its stored seed to avoid keeping every long-match frame in memory.
+            </div>
+          </div>
+        ) : batchResult ? (
+          <div style={{ width:"100%", maxWidth:860, display:"flex", flexDirection:"column", gap:12 }}>
+            <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(150px, 1fr))", gap:8 }}>
+              {[
+                [`P1 WIN RATE`, `${(batchResult.p1WinRate * 100).toFixed(1)}%`, "#ffd700"],
+                [`P2 WIN RATE`, `${(batchResult.p2WinRate * 100).toFixed(1)}%`, "#b000ff"],
+                [`AVG ICE`, `${batchResult.avgIce1.toFixed(0)} / ${batchResult.avgIce2.toFixed(0)} kg`, "#44aaff"],
+                [`AVG EXTRACTED`, `${batchResult.avgExtracted.toFixed(0)} / ${batchResult.totalMapIce.toFixed(0)} kg`, "#5dd0c9"],
+                [`MAP EXTRACTION`, `${(batchResult.avgExtractedPct * 100).toFixed(1)}%`, "#6be28c"],
+                [`AVG SCORE`, `${batchResult.avgScore1.toFixed(0)} / ${batchResult.avgScore2.toFixed(0)}`, "#66d7a5"],
+                [`JOIN RATE`, `${(batchResult.joinRate * 100).toFixed(1)}%`, "#7ad8ff"],
+                [`AVG SHARED DAYS`, `${batchResult.avgSharedDays.toFixed(1)}`, "#ffcc66"],
+              ].map(([label, value, color]) => (
+                <div key={label} style={{ background:"rgba(4,9,20,0.96)", border:`1px solid ${color}22`, borderRadius:8, padding:"10px 12px" }}>
+                  <div style={{ fontSize:6, color:"#2a4a60", letterSpacing:"0.16em", fontFamily:"'Orbitron',monospace" }}>{label}</div>
+                  <div style={{ marginTop:4, fontSize:14, color, fontFamily:"'Orbitron',monospace" }}>{value}</div>
+                </div>
+              ))}
+            </div>
+
+            <div style={{ display:"flex", gap:8 }}>
+              <button onClick={startBatchRunner} style={{
+                background:"rgba(68,170,255,0.1)", border:"1px solid rgba(68,170,255,0.35)",
+                color:"#44aaff", borderRadius:6, padding:"8px 12px", cursor:"pointer",
+                fontSize:7, letterSpacing:"0.12em", fontFamily:"'JetBrains Mono',monospace",
+              }}>RUN AGAIN</button>
+              {bestRun && (
+                <button onClick={()=>watchReplayRun(bestRun)} style={{
+                  background:"rgba(255,215,0,0.1)", border:"1px solid rgba(255,215,0,0.35)",
+                  color:"#ffd700", borderRadius:6, padding:"8px 12px", cursor:"pointer",
+                  fontSize:7, letterSpacing:"0.12em", fontFamily:"'JetBrains Mono',monospace",
+                }}>WATCH REPRESENTATIVE RUN</button>
+              )}
+            </div>
+
+            <div style={{ background:"rgba(4,9,20,0.96)", border:"1px solid rgba(255,255,255,0.09)", borderRadius:10, padding:"14px 16px" }}>
+              <div style={{ fontSize:8, color:"#4a8099", letterSpacing:"0.18em", fontFamily:"'Orbitron',monospace", marginBottom:10 }}>
+                INDIVIDUAL RUNS
+              </div>
+              <div style={{ maxHeight:420, overflowY:"auto", display:"flex", flexDirection:"column", gap:5 }}>
+                {batchResult.runs.map((run, idx) => (
+                  <div key={run.seed} style={{ display:"grid", gridTemplateColumns:"58px 68px 1fr 1fr 90px", gap:8, alignItems:"center",
+                    padding:"7px 8px", borderRadius:6, background:"rgba(255,255,255,0.02)", border:"1px solid rgba(255,255,255,0.04)" }}>
+                    <div style={{ fontSize:7, color:"#5a7f98" }}>Run {idx+1}</div>
+                    <div style={{ fontSize:7, color:run.summary.winner===1?"#ffd700":run.summary.winner===2?"#cc88ff":"#7a8a9a" }}>
+                      {run.summary.winner===0 ? "DRAW" : `P${run.summary.winner} WIN`}
+                    </div>
+                    <div style={{ fontSize:6.5, color:"#3a5570" }}>
+                      Score {run.summary.score1.toFixed(0)} / {run.summary.score2.toFixed(0)} · Ice {run.summary.ice1.toFixed(0)} / {run.summary.ice2.toFixed(0)}
+                    </div>
+                    <div style={{ fontSize:6.5, color:"#3a5570" }}>
+                      Dip {run.summary.dip1.toFixed(0)} / {run.summary.dip2.toFixed(0)} · Extracted {(run.summary.extractedPct * 100).toFixed(1)}%
+                    </div>
+                    <button onClick={()=>watchReplayRun(run)} style={{
+                      background:"rgba(255,255,255,0.04)", border:"1px solid rgba(255,255,255,0.08)",
+                      color:"#8fbfe2", borderRadius:5, padding:"6px 8px", cursor:"pointer",
+                      fontSize:7, letterSpacing:"0.08em", fontFamily:"'JetBrains Mono',monospace",
+                    }}>WATCH</button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        ) : null}
+      </div>
+    );
+  }
+
   if (!dataReady) return (
     <div style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",
       height:"100vh",background:"#020710",color:"#4a7a9a",fontFamily:"'JetBrains Mono','Courier New',monospace",
@@ -1992,7 +3883,7 @@ export default function App() {
         {/* Sim mode badge */}
         <div style={{ fontSize:6.5, color:"#2a4a60", letterSpacing:"0.15em",
           fontFamily:"'Orbitron',monospace", marginRight:4, whiteSpace:"nowrap" }}>
-          {simMode==="solo"?"👤 SOLO":simMode==="analysis"?"⚙ AUTO-SIM":"⚔ COMPETITIVE"}
+          {replayActive ? "▶ REPLAY" : simMode==="solo"?"👤 SOLO":simMode==="analysis"?"⚙ BATCH":"⚔ COMPETITIVE"}
         </div>
 
         <div style={{ width:1, height:16, background:"rgba(255,255,255,0.07)" }}/>
@@ -2009,6 +3900,17 @@ export default function App() {
           {autoAdvance ? "⏸ PAUSE" : "▶▶ AUTO"}
         </button>
 
+        <button onClick={undoLastTurn} disabled={undoStack.length===0 || replayActive || batchRunning} title="Undo the latest planning segment" style={{
+          background: undoStack.length>0 && !replayActive && !batchRunning ? "rgba(255,180,0,0.1)" : "rgba(255,255,255,0.03)",
+          border:`1px solid ${undoStack.length>0 && !replayActive && !batchRunning ? "rgba(255,180,0,0.24)" : "rgba(255,255,255,0.07)"}`,
+          color: undoStack.length>0 && !replayActive && !batchRunning ? "#ffcc66" : "#2a3d4c",
+          borderRadius:4, padding:"3px 8px", cursor: undoStack.length>0 && !replayActive && !batchRunning ? "pointer" : "default",
+          fontSize:7, fontFamily:"'JetBrains Mono',monospace", letterSpacing:"0.06em",
+          whiteSpace:"nowrap",
+        }}>
+          ↶ UNDO
+        </button>
+
         {autoAdvance && (
           <select value={autoSpeed} onChange={e=>setAutoSpeed(+e.target.value)} style={{
             background:"rgba(4,9,22,0.97)", border:"1px solid rgba(0,255,120,0.2)",
@@ -2021,6 +3923,38 @@ export default function App() {
             <option value={200}>5×</option>
             <option value={80}>12×</option>
           </select>
+        )}
+
+        {replayActive && (
+          <>
+            <div style={{ width:1, height:16, background:"rgba(255,255,255,0.07)" }}/>
+            <button onClick={()=>loadReplayFrame(replayRun, Math.max(0, replayFrameIndex - 1))} disabled={replayFrameIndex===0} style={{
+              background:"rgba(255,255,255,0.03)", border:"1px solid rgba(255,255,255,0.07)",
+              color: replayFrameIndex===0 ? "#1e3040" : "#7aaac0", borderRadius:4, padding:"3px 7px",
+              cursor: replayFrameIndex===0 ? "default" : "pointer", fontSize:7, fontFamily:"'JetBrains Mono',monospace",
+            }}>◀</button>
+            <button onClick={()=>setReplayPlaying(v=>!v)} style={{
+              background: replayPlaying ? "rgba(255,180,0,0.12)" : "rgba(0,180,255,0.08)",
+              border:`1px solid ${replayPlaying?"rgba(255,180,0,0.28)":"rgba(0,180,255,0.22)"}`,
+              color: replayPlaying ? "#ffcc66" : "#66c8ff", borderRadius:4, padding:"3px 8px",
+              cursor:"pointer", fontSize:7, fontFamily:"'JetBrains Mono',monospace",
+            }}>{replayPlaying ? "PAUSE" : "PLAY"}</button>
+            <button onClick={()=>loadReplayFrame(replayRun, Math.min((replayRun?.frames?.length ?? 1) - 1, replayFrameIndex + 1))}
+              disabled={replayFrameIndex >= (replayRun?.frames?.length ?? 1) - 1} style={{
+              background:"rgba(255,255,255,0.03)", border:"1px solid rgba(255,255,255,0.07)",
+              color: replayFrameIndex >= (replayRun?.frames?.length ?? 1) - 1 ? "#1e3040" : "#7aaac0",
+              borderRadius:4, padding:"3px 7px", cursor: replayFrameIndex >= (replayRun?.frames?.length ?? 1) - 1 ? "default" : "pointer",
+              fontSize:7, fontFamily:"'JetBrains Mono',monospace",
+            }}>▶</button>
+            <div style={{ fontSize:7, color:"#3a5570", whiteSpace:"nowrap" }}>
+              {replayFrameIndex+1}/{replayRun?.frames?.length ?? 1}
+            </div>
+            <button onClick={exitReplay} style={{
+              background:"rgba(255,120,80,0.06)", border:"1px solid rgba(255,120,80,0.18)",
+              color:"#cc7766", borderRadius:4, padding:"3px 7px", cursor:"pointer",
+              fontSize:7, fontFamily:"'JetBrains Mono',monospace",
+            }}>EXIT REPLAY</button>
+          </>
         )}
 
         <div style={{ width:1, height:16, background:"rgba(255,255,255,0.07)" }}/>
@@ -2091,7 +4025,8 @@ export default function App() {
       {/* Turn / phase prompt */}
       {(() => {
         let msg, color;
-        if (phase===PHASE.SETUP1) { msg="◉ PLAYER 1 — Click a dark PSR crater to place your base"; color="#ffd700"; }
+        if (replayActive) { msg=`▶ REPLAY MODE — Frame ${replayFrameIndex+1}/${replayRun?.frames?.length ?? 1}`; color="#44aaff"; }
+        else if (phase===PHASE.SETUP1) { msg="◉ PLAYER 1 — Click a dark PSR crater to place your base"; color="#ffd700"; }
         else if (phase===PHASE.SETUP1_HAB) { msg="◉ PLAYER 1 — Click anywhere to place your free 🏠 Habitat"; color="#ffd700"; }
         else if (phase===PHASE.SETUP1_SOL) { msg="◉ PLAYER 1 — Click anywhere to place your free ☀ Solar Panel"; color="#ffd700"; }
         else if (phase===PHASE.SETUP1_PAD) { msg="◉ PLAYER 1 — Click anywhere to place your free 🛬 Landing Pad"; color="#ffd700"; }
@@ -2100,8 +4035,13 @@ export default function App() {
         else if (phase===PHASE.SETUP2_SOL) { msg="◉ PLAYER 2 — Click anywhere to place your free ☀ Solar Panel"; color="#b000ff"; }
         else if (phase===PHASE.SETUP2_PAD) { msg="◉ PLAYER 2 — Click anywhere to place your free 🛬 Landing Pad"; color="#b000ff"; }
         else if (phase===PHASE.DONE) { msg="▶ MISSION COMPLETE · DEBRIEF BELOW"; color="#44aaff"; }
+        else if (phase===PHASE.PLAYING && scenarioPreset === "unevenArrival" && !p2 && globalDay < arrivalDelay) {
+          const daysRemaining = Math.max(0, arrivalDelay - globalDay);
+          msg=`▶ PLAYER 1 HEAD START · PLAYER 2 ARRIVES IN ${daysRemaining} DAY${daysRemaining!==1?"S":""}`;
+          color="#44aaff";
+        }
         else if (placingFor!==null) {
-          const icon = ({solar:"☀ Solar Panel",habitat:"🏠 Habitat",pad:"🛬 Landing Pad"})[placingType] || placingType;
+          const icon = ({solar:"☀ Solar Panel",reactor:"☢ Nuclear Reactor",habitat:"🏠 Habitat",pad:"🛬 Landing Pad"})[placingType] || placingType;
           msg=`📍 P${placingFor+1} — Click anywhere to place ${icon}`;
           color=placingFor===0?"#ffd700":"#b000ff";
         }
@@ -2138,7 +4078,7 @@ export default function App() {
           { label:"PLAYER 1", val:score1.toFixed(0), color:"#ffd700",
             sub:`💧 ${totalIce1.toFixed(0)}kg · 🏗 ${p1?.assetPts??0}ap · 🤝 ${Math.round(p1?.diplomacy??0)}`,
             sub2:`${Math.round(p1?.budget??0)}cr · ${(share1*100).toFixed(0)}%` },
-          { label:`R${round}/${totalRounds} · D${day+1}/${DAYS_PER_ROUND}`,
+          { label:roundCounterLabel,
             val:`${depleted}/${CRATER_DATA.length}`, color:"#2a5070",
             sub:"craters depleted", sub2:"" },
           { label:"PLAYER 2", val:score2.toFixed(0), color:"#b000ff",
@@ -2176,14 +4116,58 @@ export default function App() {
         {[0,1].map(pi => {
           const p = pi===0 ? p1 : p2;
           const color = pi===0 ? "#ffd700" : "#b000ff";
-          if (!p) return (
-            <div key={pi} style={{ width:170, flexShrink:0, background:"rgba(255,255,255,0.02)",
-              border:"1px solid rgba(255,255,255,0.05)", borderRadius:8, padding:10,
-              display:"flex", alignItems:"center", justifyContent:"center",
-              color:"#1a3050", fontSize:8, letterSpacing:"0.12em", minHeight:120 }}>
-              AWAITING
-            </div>
-          );
+          if (!p) {
+            if (scenarioPreset === "unevenArrival" && pi === 1 && phase === PHASE.PLAYING && globalDay < arrivalDelay) {
+              const daysRemaining = Math.max(0, arrivalDelay - globalDay);
+              return (
+                <div key={pi} style={{ width:170, flexShrink:0, background:"rgba(20,10,30,0.92)",
+                  border:"1px solid rgba(120,160,255,0.18)", borderRadius:8, padding:10,
+                  minHeight:120, boxShadow:"inset 0 0 24px rgba(80,120,255,0.06)" }}>
+                  <div style={{ fontSize:10, fontWeight:900, color:color, letterSpacing:"0.12em",
+                    fontFamily:"'Orbitron',monospace", marginBottom:8 }}>P2</div>
+                  <div style={{ fontSize:7, color:"#6a8fa8", letterSpacing:"0.08em", marginBottom:6 }}>
+                    ARRIVAL DELAY ACTIVE
+                  </div>
+                  <div style={{ fontSize:18, color:"#44aaff", fontWeight:900,
+                    fontFamily:"'Orbitron',monospace", marginBottom:4 }}>
+                    D+{arrivalDelay}
+                  </div>
+                  <div style={{ fontSize:7, color:"#3a5570", lineHeight:1.8 }}>
+                    Player 2 lands in {daysRemaining} day{daysRemaining!==1?"s":""}.
+                  </div>
+                </div>
+              );
+            }
+            return (
+              <div key={pi} style={{ width:170, flexShrink:0, background:"rgba(255,255,255,0.02)",
+                border:"1px solid rgba(255,255,255,0.05)", borderRadius:8, padding:10,
+                display:"flex", alignItems:"center", justifyContent:"center",
+                color:"#1a3050", fontSize:8, letterSpacing:"0.12em", minHeight:120 }}>
+                AWAITING
+              </div>
+            );
+          }
+          if (p.active === false) {
+            const daysRemaining = Math.max(0, (p.arrivalDay ?? arrivalDelay) - globalDay);
+            return (
+              <div key={pi} style={{ width:170, flexShrink:0, background:"rgba(20,10,30,0.92)",
+                border:"1px solid rgba(120,160,255,0.18)", borderRadius:8, padding:10,
+                minHeight:120, boxShadow:"inset 0 0 24px rgba(80,120,255,0.06)" }}>
+                <div style={{ fontSize:10, fontWeight:900, color:color, letterSpacing:"0.12em",
+                  fontFamily:"'Orbitron',monospace", marginBottom:8 }}>P{pi+1}</div>
+                <div style={{ fontSize:7, color:"#6a8fa8", letterSpacing:"0.08em", marginBottom:6 }}>
+                  ARRIVAL DELAY ACTIVE
+                </div>
+                <div style={{ fontSize:18, color:"#44aaff", fontWeight:900,
+                  fontFamily:"'Orbitron',monospace", marginBottom:4 }}>
+                  D+{p.arrivalDay ?? arrivalDelay}
+                </div>
+                <div style={{ fontSize:7, color:"#3a5570", lineHeight:1.8 }}>
+                  Player {pi+1} lands in {daysRemaining} day{daysRemaining!==1?"s":""}.
+                </div>
+              </div>
+            );
+          }
 
           const panelPwr = p.panels.reduce((s,pn)=>{
             if (night) return s; // no charging at night
@@ -2191,9 +4175,14 @@ export default function App() {
             const illum2=(px2>=0&&px2<W*H)?ILLUM_MAP[px2]:1.0;
             return s+PANEL_RIDGE*illum2;
           },0);
+          const reactorPwr = (p.reactors||[]).reduce((s, _, i) => {
+            const health = p.structureHealth?.reactors?.[i] ?? 1.0;
+            return health > 0 ? s + REACTOR_OUTPUT : s;
+          }, 0);
           const isSelecting = selectingFor===pi;
           const roverIdx    = selectedRover[pi];
           const activeRover = roverIdx === 0 ? p : (p.extraRovers||[])[roverIdx - 1];
+          const activeRoverLabel = `R${roverIdx + 1}`;
           const wpCount     = activeRover
             ? (activeRover.waypoints||[]).length + (activeRover.currentWaypoint ? 1 : 0) : 0;
           const totalRovers = 1 + (p.extraRovers||[]).length;
@@ -2234,26 +4223,41 @@ export default function App() {
 
               {/* Power */}
               <div style={{ marginBottom:6 }}>
+                {(() => {
+                  const roverPower = activeRover?.power ?? p.power;
+                  const powerLow = roverPower > POWER_LOW;
+                  return (
+                    <>
                 <div style={{ display:"flex", justifyContent:"space-between", fontSize:7, color:"#1e3040", marginBottom:2 }}>
-                  <span>⚡ POWER</span>
-                  <span style={{ color:p.power>POWER_LOW?"#77ee33":"#ee4433",
-                    fontFamily:"'JetBrains Mono',monospace" }}>{p.power.toFixed(0)}/{POWER_CAP}</span>
+                  <span>⚡ {activeRoverLabel} POWER</span>
+                  <span style={{ color:powerLow?"#77ee33":"#ee4433",
+                    fontFamily:"'JetBrains Mono',monospace" }}>{roverPower.toFixed(0)}/{POWER_CAP}</span>
                 </div>
-                <Bar val={p.power} max={POWER_CAP} color={p.power>POWER_LOW?"#66ee33":"#ee3322"} h={4} />
+                <Bar val={roverPower} max={POWER_CAP} color={powerLow?"#66ee33":"#ee3322"} h={4} />
+                    </>
+                  );
+                })()}
                 <div style={{ fontSize:6, color:night?"#4a3a18":"#1e2e18", marginTop:2, letterSpacing:"0.04em" }}>
-                  +{panelPwr}/day{night?" 🌙":""} · {p.panels.length} panel{p.panels.length!==1?"s":""}
+                  {activeRoverLabel} battery ·
+                  +{Math.round(panelPwr + reactorPwr)}/day · {p.panels.length} panel{p.panels.length!==1?"s":""}
+                  {(p.reactors||[]).length>0 &&
+                    <span style={{color}}> · {(p.reactors||[]).length} ☢ reactor{(p.reactors||[]).length!==1?"s":""}</span>}
                   {p.panels.filter(pn=>pn.onRidge).length>0 &&
                     <span style={{color:"#88cc33"}}> ({p.panels.filter(pn=>pn.onRidge).length}★ridge)</span>}
+                  {night && p.panels.length>0 && <span style={{color:"#8866cc"}}> 🌙 solar offline</span>}
                 </div>
               </div>
 
               {/* Ice carry — shows selected rover's cargo */}
               <div style={{ marginBottom:6 }}>
                 <div style={{ display:"flex", justifyContent:"space-between", fontSize:7, color:"#1e3040", marginBottom:2 }}>
-                  <span>❄ ICE CARRY{roverIdx>0?` R${roverIdx+1}`:""}</span>
+                  <span>❄ {activeRoverLabel} ICE CARRY</span>
                   <span style={{color:"#66aadd",fontFamily:"'JetBrains Mono',monospace"}}>{(activeRover?.ice??p.ice).toFixed(0)}/{ICE_CAP}kg</span>
                 </div>
                 <Bar val={activeRover?.ice??p.ice} max={ICE_CAP} color="#3399cc" h={4} />
+                <div style={{ fontSize:6, color:"#1e2e38", marginTop:2, letterSpacing:"0.04em" }}>
+                  Cargo currently loaded on {activeRoverLabel.toLowerCase()}
+                </div>
               </div>
 
               {/* Budget */}
@@ -2289,6 +4293,7 @@ export default function App() {
                   { icon:"🛬", count:(p.landingPads||[]).length,   pts:ASSET_POINTS.pad     },
                   { icon:"🚗", count:(p.extraRovers||[]).length + 1, pts:ASSET_POINTS.rover   },
                   { icon:"☀", count:p.panels.length,               pts:ASSET_POINTS.solar   },
+                  { icon:"☢", count:(p.reactors||[]).length,       pts:ASSET_POINTS.reactor },
                 ].filter(b => b.count > 0);
                 const ptsCol = pts >= 20 ? "#ff9944" : pts >= 10 ? "#ffcc44" : "#667788";
                 return (
@@ -2337,19 +4342,22 @@ export default function App() {
               {/* Diplomacy */}
               {(() => {
                 const dip = p.diplomacy ?? 0;
-                // Thresholds divide the [-100, 100] range into 5 bands.
-                //   [-100, -60)  Infamous   red
-                //   [-60,  -20)  Cautious   orange
-                //   [-20,   20]  Neutral    grey
-                //   ( 20,   60]  Friendly   teal
-                //   ( 60,  100]  Amicable   green
-                const dipLabel = dip < -60 ? "XX Infamous"
-                               : dip < -20 ? "!! Cautious"
+                // Thresholds divide the [-100, 100] range into clearer negative tiers.
+                //   [-100, -75)  Hated      deep red
+                //   [ -75, -45)  Terrible   red-orange
+                //   [ -45, -10)  Bad        orange
+                //   [ -10,  20]  Neutral    grey
+                //   (  20,  60]  Friendly   teal
+                //   (  60, 100]  Amicable   green
+                const dipLabel = dip < -75 ? "!! Hated"
+                               : dip < -45 ? "!! Terrible"
+                               : dip < -10 ? "!! Bad"
                                : dip <=  20 ? "== Neutral"
                                : dip <=  60 ? "~~ Friendly"
                                :              "++ Amicable";
-                const dipCol = dip < -60 ? "#ff5533"
-                             : dip < -20 ? "#ffaa44"
+                const dipCol = dip < -75 ? "#ff3344"
+                             : dip < -45 ? "#ff6644"
+                             : dip < -10 ? "#ffaa44"
                              : dip <=  20 ? "#888899"
                              : dip <=  60 ? "#44ccdd"
                              :              "#44ddaa";
@@ -2372,6 +4380,7 @@ export default function App() {
                 const projBudget = calcBudget(E);
                 const { costs: aC, maint: aM } = calcAssetCosts(alloc);
                 const totalMaint = (p.panels.length * aM.solar)
+                  + (((p.reactors||[]).length) * aM.reactor)
                   + ((p.habitats||[]).length * aM.habitat)
                   + ((p.extraRovers||[]).length * aM.rover)
                   + ((p.landingPads||[]).length * aM.pad);
@@ -2416,7 +4425,7 @@ export default function App() {
                         <span key={k} style={{ fontSize:5, color:"#1e3040",
                           background:"rgba(255,255,255,0.04)", borderRadius:2, padding:"2px 4px",
                           border:"1px solid rgba(255,255,255,0.04)" }}>
-                          {({solar:"☀",habitat:"🏠",rover:"🚗",pad:"🛬"})[k]} {v}cr
+                          {({solar:"☀",reactor:"☢",habitat:"🏠",rover:"🚗",pad:"🛬"})[k]} {v}cr
                         </span>
                       ))}
                     </div>
@@ -2498,6 +4507,7 @@ export default function App() {
                   const { costs: aCosts, maint: aMaint } = calcAssetCosts(p.alloc || { mil:20, rd:20, econ:60 });
                   const BUILD_OPTIONS = [
                     { type:"solar",   label:"☀ Solar Panel",   cost:aCosts.solar,   maint:aMaint.solar,   pts:ASSET_POINTS.solar,   max:MAX_PANELS,   count:p.panels.length },
+                    { type:"reactor", label:"☢ Nuclear Reactor", cost:aCosts.reactor, maint:aMaint.reactor, pts:ASSET_POINTS.reactor, max:MAX_REACTORS, count:(p.reactors||[]).length },
                     { type:"habitat", label:"🏠 Habitat",       cost:aCosts.habitat, maint:aMaint.habitat, pts:ASSET_POINTS.habitat, max:MAX_HABITATS, count:(p.habitats||[]).length },
                     { type:"rover",   label:"🚗 Rover",         cost:aCosts.rover,   maint:aMaint.rover,   pts:ASSET_POINTS.rover,   max:MAX_ROVERS,   count:(p.extraRovers||[]).length + 1 },
                     { type:"pad",     label:"🛬 Landing Pad",   cost:aCosts.pad,     maint:aMaint.pad,     pts:ASSET_POINTS.pad,     max:MAX_PADS,     count:(p.landingPads||[]).length },
@@ -2507,7 +4517,7 @@ export default function App() {
                   const chosen = BUILD_OPTIONS.find(o=>o.type===sel);
                   const padIdx = Math.min(selectedPad[pi], Math.max(0, pads.length-1));
                   const hasPad = pads.length > 0;
-                  const padFree = round === 1 || chosen?.type === "pad";
+                  const padFree = hasPlacementGrace(p.arrivalDay, globalDay) || chosen?.type === "pad";
                   const canDo = chosen && (p.budget??0)>=chosen.cost && chosen.count<chosen.max && !isDone && (hasPad || padFree || chosen.type==="rover");
                   const pendingHere = (p.pendingDeliveries||[]).filter(d=>d.padIdx===padIdx);
                   return (
@@ -2591,16 +4601,73 @@ export default function App() {
                         <div style={{fontSize:7, color:"#cc9922", padding:"3px 0",
                           background:"rgba(255,180,0,0.05)", border:"1px solid rgba(255,180,0,0.12)",
                           borderRadius:3, textAlign:"center", letterSpacing:"0.06em"}}>
-                          🛬 {(p.pendingDeliveries||[]).map(d=>({solar:"☀",habitat:"🏠",rover:"🚗",pad:"🛬"})[d.type]||"?").join(" ")} IN TRANSIT
+                          🛬 {(p.pendingDeliveries||[]).map(d=>({solar:"☀",reactor:"☢",habitat:"🏠",rover:"🚗",pad:"🛬"})[d.type]||"?").join(" ")} IN TRANSIT
                         </div>
                       )}
                       {(activeRover?.carrying ?? p.carrying) && (
                         <div style={{fontSize:7, color:"#bb8833", padding:"3px 0",
                           background:"rgba(255,140,0,0.05)", border:"1px solid rgba(255,140,0,0.1)",
                           borderRadius:3, textAlign:"center", letterSpacing:"0.05em"}}>
-                          🚚 {roverIdx>0?`R${roverIdx+1} `:""}{({solar:"☀",habitat:"🏠",rover:"🚗",pad:"🛬"})[(activeRover?.carrying??p.carrying).type]} — SET DESTINATION
+                          🚚 {roverIdx>0?`R${roverIdx+1} `:""}{({solar:"☀",reactor:"☢",habitat:"🏠",rover:"🚗",pad:"🛬"})[(activeRover?.carrying??p.carrying).type]} — SET DESTINATION
                         </div>
                       )}
+                    </div>
+                  );
+                })()}
+
+                {/* Diplomatic decisions */}
+                {(() => {
+                  const dipOptions = getDiplomacyOptions(pi);
+                  const sel = selectedDiplomacy[pi];
+                  const statusText = !gridSharingEnabled
+                    ? "GRID STATUS: DISABLED"
+                    : powerGridState.mode === "shared"
+                    ? `GRID STATUS: SHARED${gridSharingPermanent ? " · PERMANENT" : ""}`
+                    : powerGridState.mode === "offered" && powerGridState.offeredBy === pi + 1
+                      ? `GRID STATUS: OFFER OUT TO P${powerGridState.offeredTo}`
+                      : powerGridState.mode === "offered" && powerGridState.offeredTo === pi + 1
+                        ? `GRID STATUS: OFFER FROM P${powerGridState.offeredBy}`
+                        : "GRID STATUS: INDEPENDENT";
+                  return (
+                    <div style={{ display:"flex", flexDirection:"column", gap:3,
+                      background:"rgba(255,255,255,0.02)", border:"1px solid rgba(255,255,255,0.04)",
+                      borderRadius:5, padding:"6px 6px 5px" }}>
+                      <select
+                        value={sel||""}
+                        onChange={e => setSelectedDiplomacy(prev => { const n=[...prev]; n[pi]=e.target.value||null; return n; })}
+                        disabled={isDone || dipOptions.length === 0}
+                        style={{
+                          background:"rgba(4,9,22,0.98)",
+                          border:`1px solid ${isDone?"rgba(255,255,255,0.04)":sel?(color+"44"):"rgba(255,255,255,0.1)"}`,
+                          color:isDone?"#0d1820":sel?color:(dipOptions.length === 0 ? "#203040" : "#3a5570"),
+                          borderRadius:4, padding:"5px 5px",
+                          cursor:isDone||dipOptions.length===0?"not-allowed":"pointer",
+                          fontSize:7, fontFamily:"inherit", letterSpacing:"0.05em", outline:"none", width:"100%",
+                          opacity:isDone?0.35:1,
+                        }}>
+                        <option value="">🤝 DIPLOMATIC DECISIONS</option>
+                        {dipOptions.map(o => (
+                          <option key={o.type} value={o.type} style={{ background:"#040916", color:"#7aaac0" }}>
+                            {o.label}
+                          </option>
+                        ))}
+                      </select>
+                      <div style={{ fontSize:6, color:"#2a5070", letterSpacing:"0.06em", textAlign:"center" }}>
+                        {statusText}
+                      </div>
+                      <button
+                        onClick={() => executeDiplomaticDecision(pi)}
+                        disabled={!sel || isDone}
+                        style={{
+                          background: sel ? `rgba(${pi===0?"120,220,255":"180,120,255"},0.08)` : "rgba(255,255,255,0.02)",
+                          border:`1px solid ${sel?(pi===0?"rgba(120,220,255,0.35)":"rgba(180,120,255,0.35)"):"rgba(255,255,255,0.05)"}`,
+                          color: sel ? "#7ad8ff" : "#1a2030",
+                          borderRadius:5, padding:"5px 0",
+                          cursor: sel && !isDone ? "pointer" : "not-allowed",
+                          fontSize:7, fontFamily:"inherit", opacity:isDone?0.35:1, letterSpacing:"0.05em",
+                        }}>
+                        {sel ? "TRANSMIT DECISION" : "SELECT A DIPLOMATIC ACTION"}
+                      </button>
                     </div>
                   );
                 })()}
@@ -2780,7 +4847,7 @@ export default function App() {
         }}>
           <div style={{fontSize:7,letterSpacing:"0.4em",color:"#2a4050",marginBottom:14,
             fontFamily:"'Orbitron',monospace"}}>
-            MISSION DEBRIEF — {totalRounds} ROUNDS · {totalRounds*DAYS_PER_ROUND} DAYS
+            MISSION DEBRIEF — {durationSummaryLabel}
           </div>
           <div style={{display:"flex",gap:30,justifyContent:"center",marginBottom:14}}>
             {[p1,p2].map((p,i) => {
@@ -2821,7 +4888,7 @@ export default function App() {
             {winner===1?"PLAYER 1 WINS":winner===2?"PLAYER 2 WINS":"DRAW"}
           </div>
           <div style={{fontSize:8,color:"#2a3a4a",marginBottom:18,letterSpacing:"0.06em"}}>
-            {depleted} of {CRATER_DATA.length} craters depleted · {totalRounds*DAYS_PER_ROUND} days elapsed
+            {depleted} of {CRATER_DATA.length} craters depleted · {globalDay} days elapsed
           </div>
           <div style={{display:"flex",gap:8,justifyContent:"center"}}>
             <button onClick={()=>setPhase(PHASE.SETTINGS)} style={{
@@ -2863,7 +4930,11 @@ export default function App() {
                 Events will appear here as the mission progresses.
               </div>
             ) : [...missionLog].reverse().slice(0, 60).map((ev, i) => {
-              const col = ev.type==="deposit"?"#44ff88":ev.type==="mine"?"#00d4ff":ev.type==="place"?"#ffaa44":"#3a5570";
+              const col = ev.type==="deposit"?"#44ff88"
+                : ev.type==="mine"?"#00d4ff"
+                : ev.type==="place"?"#ffaa44"
+                : ev.type==="diplomacy"?"#7ad8ff"
+                : "#3a5570";
               return (
                 <div key={i} style={{ display:"flex", gap:8, fontSize:6.5,
                   color:col, padding:"1px 0", borderBottom:"1px solid rgba(255,255,255,0.02)" }}>
@@ -2871,6 +4942,7 @@ export default function App() {
                   <span style={{ minWidth:55 }}>{ev.type.toUpperCase()}</span>
                   {ev.kg != null && <span>{ev.kg.toFixed(1)} kg</span>}
                   {ev.craterIdx != null && <span style={{color:"#1a3040"}}>crater#{ev.craterIdx}</span>}
+                  {ev.label && <span style={{ color:col }}>{ev.label}</span>}
                 </div>
               );
             })}
