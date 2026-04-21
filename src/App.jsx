@@ -649,7 +649,7 @@ function simDay(s, craterHealth, globalDay, po={}) {
       if (waypoints.length > 0) waypoints = waypoints.slice(1);
     }
 
-    if (onPSR && craterIdx >= 0) {
+    if (onPSR && craterIdx >= 0 && power > 0) {
       const health = craterHealth[craterIdx] ?? 1.0;
       const quality = CRATER_DATA[craterIdx]?.quality ?? 0.5;
       const craterSize = CRATER_DATA[craterIdx]?.size ?? CRATER_REFERENCE_SIZE;
