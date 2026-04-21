@@ -1371,15 +1371,13 @@ export default function App() {
         generators.some(g => d2({ x: cx, y: cy }, g) <= g.range);
 
       const drawPowerBolt = (cx, cy, ringR) => {
-        // Place bolt at upper-left of the safety ring, with a minimum clearance
-        // from centre so it stays readable even on tiny rover rings.
         const arm = Math.max(ringR, 14) * 0.707;
         ctx.save();
         ctx.font = "bold 9px monospace";
         ctx.textAlign = "center";
         ctx.textBaseline = "middle";
-        ctx.fillStyle = inPowerRange(cx, cy) ? "#44ff88" : "#ff4444";
-        ctx.fillText("⚡", cx - arm, cy - arm);
+        ctx.fillStyle = "#ffffff";
+        ctx.fillText(inPowerRange(cx, cy) ? "⚡" : "🔋", cx - arm, cy - arm);
         ctx.restore();
       };
 
