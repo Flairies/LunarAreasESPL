@@ -994,7 +994,6 @@ export default function App() {
         { list: p.panels||[],       type:'solar',   key:'panels' },
         { list: p.reactors||[],     type:'reactor', key:'reactors' },
         { list: p.habitats||[],     type:'habitat', key:'habitats' },
-        { list: p.extraRovers||[], type:'rover',   key:'extraRovers' },
         { list: p.landingPads||[], type:'pad',     key:'landingPads' },
       ];
       for (const { list, type, key } of structList) {
@@ -1055,6 +1054,11 @@ export default function App() {
           ctx.fillText("★",0,-6);
         }
         if (health < 0.99) drawHealthBar(ctx, health);
+        ctx.shadowColor = "rgba(0,0,0,0.9)"; ctx.shadowBlur = 2;
+        ctx.fillStyle = "#ffffff"; ctx.font = "bold 8px monospace";
+        ctx.textAlign = "center"; ctx.textBaseline = "bottom";
+        ctx.fillText(String(idx + 1), 0, pn.onRidge ? -22 : -17);
+        ctx.shadowBlur = 0;
         ctx.restore();
       });
     }
@@ -1075,6 +1079,11 @@ export default function App() {
         ctx.font = "bold 10px monospace"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
         ctx.fillText("☢", 0, 0);
         if (health < 0.99) drawHealthBar(ctx, health, 18);
+        ctx.shadowColor = "rgba(0,0,0,0.9)"; ctx.shadowBlur = 2;
+        ctx.fillStyle = "#ffffff"; ctx.font = "bold 8px monospace";
+        ctx.textAlign = "center"; ctx.textBaseline = "bottom";
+        ctx.fillText(String(idx + 1), 0, -17);
+        ctx.shadowBlur = 0;
         ctx.restore();
       });
     }
@@ -1096,6 +1105,11 @@ export default function App() {
         ctx.fillStyle = destroyed ? "#888" : "#000"; ctx.font = "6px monospace"; ctx.textAlign="center"; ctx.textBaseline="middle";
         ctx.fillText(destroyed ? "X" : unpowered ? "!" : "H", 0, 0);
         if (!destroyed && health < 0.99) drawHealthBar(ctx, health);
+        ctx.shadowColor = "rgba(0,0,0,0.9)"; ctx.shadowBlur = 2;
+        ctx.fillStyle = "#ffffff"; ctx.font = "bold 8px monospace";
+        ctx.textAlign = "center"; ctx.textBaseline = "bottom";
+        ctx.fillText(String(idx + 1), 0, -17);
+        ctx.shadowBlur = 0;
         // Power bar below habitat
         if (!destroyed) {
           const barW = 14, barH = 2, barX = -7, barY = 7;
@@ -1116,14 +1130,14 @@ export default function App() {
         const health = p.structureHealth?.extraRovers?.[idx] ?? 1.0;
         const erSi = STATUS_INFO[r.status] || STATUS_INFO.idle;
         ctx.save(); ctx.translate(r.x, r.y);
-        ctx.fillStyle = p.color + "99";
-        ctx.fillRect(-5, -3, 10, 6);
-        ctx.strokeStyle = p.color; ctx.lineWidth = 1.2; ctx.strokeRect(-5, -3, 10, 6);
-        ctx.fillStyle = "#000"; ctx.font = "6px monospace"; ctx.textAlign="center"; ctx.textBaseline="middle";
+        ctx.beginPath(); ctx.arc(0, 0, 7, 0, Math.PI*2);
+        ctx.fillStyle = p.color; ctx.fill();
+        ctx.strokeStyle = "#000"; ctx.lineWidth = 1.5; ctx.stroke();
+        ctx.fillStyle = "#000"; ctx.font = "bold 8px monospace"; ctx.textAlign="center"; ctx.textBaseline="middle";
         ctx.fillText(`${idx+2}`, 0, 0);
         // Status icon
-        ctx.font="8px monospace"; ctx.textAlign="center"; ctx.textBaseline="bottom";
-        ctx.fillText(erSi.icon, 0, -5);
+        ctx.font="10px monospace"; ctx.textAlign="center"; ctx.textBaseline="bottom";
+        ctx.fillText(erSi.icon, 0, -9);
         // Ice bubble
         if ((r.ice??0) > 5) {
           ctx.fillStyle="rgba(3,8,20,0.85)"; ctx.fillRect(7,-18,38,11);
@@ -1176,6 +1190,11 @@ export default function App() {
           }
           if (health < 0.99) drawHealthBar(ctx, health, 18);
         }
+        ctx.shadowColor = "rgba(0,0,0,0.9)"; ctx.shadowBlur = 2;
+        ctx.fillStyle = "#ffffff"; ctx.font = "bold 8px monospace";
+        ctx.textAlign = "center"; ctx.textBaseline = "top";
+        ctx.fillText(String(lpIdx + 1), 0, 13);
+        ctx.shadowBlur = 0;
         ctx.restore();
       });
     }
@@ -1261,15 +1280,18 @@ export default function App() {
       if (!p || p.active === false) continue;
       const si = STATUS_INFO[p.status] || STATUS_INFO.idle;
 
-      // Turn indicator ring
+      // Turn indicator ring — drawn around the currently selected rover
       const isActive = (activeTurn===0 && p.id===1) || (activeTurn===1 && p.id===2);
       const isDone   = (p.id===1 && p1Done) || (p.id===2 && p2Done);
       if (phase===PHASE.PLAYING) {
-        ctx.beginPath(); ctx.arc(p.x, p.y, 14, 0, Math.PI*2);
-        ctx.strokeStyle = isDone ? "#44ff66aa" : isActive ? p.color+"cc" : p.color+"22";
-        ctx.lineWidth = isDone ? 1.5 : isActive ? 2 : 1;
-        ctx.setLineDash(isDone ? [] : isActive ? [] : [3,3]);
-        ctx.stroke(); ctx.setLineDash([]);
+        const selIdx = selectedRover[p.id - 1] ?? 0;
+        const selRover = selIdx === 0 ? p : (p.extraRovers||[])[selIdx - 1];
+        const rx = selRover?.x ?? p.x;
+        const ry = selRover?.y ?? p.y;
+        ctx.beginPath(); ctx.arc(rx, ry, 14, 0, Math.PI*2);
+        ctx.strokeStyle = isDone ? "#44ff66cc" : p.color+"cc";
+        ctx.lineWidth = isDone ? 1.5 : isActive ? 2 : 1.5;
+        ctx.stroke();
       }
 
       ctx.beginPath(); ctx.arc(p.x, p.y, 7, 0, Math.PI*2);
@@ -1277,7 +1299,7 @@ export default function App() {
       ctx.strokeStyle="#000"; ctx.lineWidth=1.5; ctx.stroke();
       ctx.fillStyle="#000"; ctx.font="bold 8px monospace";
       ctx.textAlign="center"; ctx.textBaseline="middle";
-      ctx.fillText(p.id.toString(), p.x, p.y);
+      ctx.fillText("1", p.x, p.y);
 
       // Status icon above
       ctx.font="10px monospace"; ctx.textAlign="center"; ctx.textBaseline="bottom";
@@ -1304,6 +1326,75 @@ export default function App() {
       ctx.beginPath(); ctx.arc(p.x+9,p.y+9,4,0,Math.PI*2);
       ctx.fillStyle=pwrCol; ctx.fill();
       ctx.strokeStyle="#000"; ctx.lineWidth=0.5; ctx.stroke();
+    }
+
+    // Rover safety zones (drawn after sprites so they appear on top as visible rings)
+    for (const p of [p1, p2]) {
+      if (!p || p.active === false) continue;
+      const sh = p.structureHealth || {};
+      const drawRoverZone = (cx, cy, health) => {
+        const r = SAFETY_RADIUS.rover;
+        ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI*2);
+        const alpha = health > 0.6 ? "18" : health > 0.3 ? "28" : "38";
+        ctx.fillStyle = p.color + alpha;
+        ctx.fill();
+        ctx.strokeStyle = p.color + "55";
+        ctx.lineWidth = 0.8;
+        ctx.setLineDash([3,3]); ctx.stroke(); ctx.setLineDash([]);
+      };
+      const primaryHealth = 1.0;
+      drawRoverZone(p.x, p.y, primaryHealth);
+      (p.extraRovers||[]).forEach((er, idx) => {
+        const health = sh.extraRovers?.[idx] ?? 1.0;
+        drawRoverZone(er.x, er.y, health);
+      });
+    }
+
+    // ── Power-in-range ⚡ indicators on consumer safety rings ─────────────
+    {
+      const physNight = isNight(globalDay);
+      // Gather every functional generator across both players
+      const generators = [];
+      for (const gp of [p1, p2]) {
+        if (!gp || gp.active === false) continue;
+        (gp.panels || []).forEach((pn, idx) => {
+          if ((gp.structureHealth?.panels?.[idx] ?? 1.0) <= 0) return;
+          if (physNight && (ILLUM_MAP[pn.y * W + pn.x] || 0) < 0.05) return;
+          generators.push({ x: pn.x, y: pn.y, range: SAFETY_RADIUS.solar });
+        });
+        (gp.reactors || []).forEach((rx, idx) => {
+          if ((gp.structureHealth?.reactors?.[idx] ?? 1.0) <= 0) return;
+          generators.push({ x: rx.x, y: rx.y, range: SAFETY_RADIUS.reactor });
+        });
+      }
+      const inPowerRange = (cx, cy) =>
+        generators.some(g => d2({ x: cx, y: cy }, g) <= g.range);
+
+      const drawPowerBolt = (cx, cy, ringR) => {
+        // Place bolt at upper-left of the safety ring, with a minimum clearance
+        // from centre so it stays readable even on tiny rover rings.
+        const arm = Math.max(ringR, 14) * 0.707;
+        ctx.save();
+        ctx.font = "bold 9px monospace";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillStyle = inPowerRange(cx, cy) ? "#44ff88" : "#ff4444";
+        ctx.fillText("⚡", cx - arm, cy - arm);
+        ctx.restore();
+      };
+
+      for (const p of [p1, p2]) {
+        if (!p || p.active === false) continue;
+        drawPowerBolt(p.x, p.y, SAFETY_RADIUS.rover);
+        (p.extraRovers || []).forEach((er, idx) => {
+          if ((p.structureHealth?.extraRovers?.[idx] ?? 1.0) <= 0) return;
+          drawPowerBolt(er.x, er.y, SAFETY_RADIUS.rover);
+        });
+        (p.habitats || []).forEach((h, idx) => {
+          if ((p.structureHealth?.habitats?.[idx] ?? 1.0) <= 0) return;
+          drawPowerBolt(h.x, h.y, SAFETY_RADIUS.habitat);
+        });
+      }
     }
 
     // Night overlay text
@@ -1397,7 +1488,7 @@ export default function App() {
       ctx.setLineDash([]);
       ctx.restore();
     }
-  }, [p1, p2, craterHealth, hover, selectingFor, claimR, globalDay, mapLoaded, showLayers, activeTurn, p1Done, p2Done, phase, mapLayer, annotations, annotating]);
+  }, [p1, p2, craterHealth, hover, selectingFor, claimR, globalDay, mapLoaded, showLayers, activeTurn, p1Done, p2Done, phase, mapLayer, annotations, annotating, selectedRover]);
 
   useEffect(() => { draw(); }, [draw]);
 
@@ -3609,7 +3700,12 @@ export default function App() {
   ]);
 
   const plotDefinitions = useMemo(() => {
-    const frames = plotSource.frames || [];
+    // Collapse to one frame per global day (last frame wins — has the most log
+    // entries and the most up-to-date player state for that day).
+    const allFrames = plotSource.frames || [];
+    const dayMap = new Map();
+    allFrames.forEach(f => dayMap.set(f.globalDay ?? 0, f));
+    const frames = Array.from(dayMap.values());
     const log = plotSource.log || [];
     if (!frames.length) return [];
 
@@ -3739,7 +3835,7 @@ export default function App() {
       });
       while (logCursor < log.length && logCursor < (frame.logLength || 0)) {
         const ev = log[logCursor];
-        if (ev?.type === "deposit" && ev.actor && ev.roverId) {
+        if (ev?.type === "mine" && ev.actor && ev.roverId) {
           const key = ensureRoverIceSeries(ev.actor, ev.roverId);
           roverIceTotals[key] = (roverIceTotals[key] || 0) + (ev.kg || 0);
           roverIceMap.get(key).data[frameIdx] = roverIceTotals[key];
@@ -3872,8 +3968,12 @@ export default function App() {
       { key:"score-p2", label:"P2 Score", color:seriesColor(2, "score", 1, 1), data:frames.map(f => scorePlayerState(f.p2)) },
     ];
     const budgetSeries = [
-      { key:"budget-p1", label:"P1 Budget", color:seriesColor(1, "score", 1, 1), data:frames.map(f => f.p1?.budget ?? 0) },
-      { key:"budget-p2", label:"P2 Budget", color:seriesColor(2, "score", 1, 1), data:frames.map(f => f.p2?.budget ?? 0) },
+      { key:"budget-p1", label:"P1 Remaining Credits", color:seriesColor(1, "score", 1, 1), data:frames.map(f => f.p1?.budget ?? 0) },
+      { key:"budget-p2", label:"P2 Remaining Credits", color:seriesColor(2, "score", 1, 1), data:frames.map(f => f.p2?.budget ?? 0) },
+    ];
+    const cumCreditsSeries = [
+      { key:"cumcredits-p1", label:"P1 Cumulative Credits", color:seriesColor(1, "score", 1, 1), data:frames.map(f => (f.history || []).reduce((sum, h) => sum + (h.bud1 || 0), 0)) },
+      { key:"cumcredits-p2", label:"P2 Cumulative Credits", color:seriesColor(2, "score", 1, 1), data:frames.map(f => (f.history || []).reduce((sum, h) => sum + (h.bud2 || 0), 0)) },
     ];
     const violationSeries = [
       { key:"vio-p1", label:"P1 Violations", color:seriesColor(1, "violation", 1, 1), data:frames.map(f => f.p1?.safetyViolations ?? 0) },
@@ -3937,7 +4037,7 @@ export default function App() {
     );
 
     const purchaseSeriesMap = new Map();
-    const purchaseLabels = ["Solar Panel", "Nuclear Reactor", "Habitat", "Rover"];
+    const purchaseLabels = ["Solar Panel", "Nuclear Reactor", "Habitat", "Rover", "Landing Pad"];
     const resupplyLabels = ["No Resupply", "Resupply"];
     let purchaseCursor = 0;
     const addPointSeries = (map, prefix, ev, idx, colorType, customLabel) => {
@@ -3970,7 +4070,7 @@ export default function App() {
               typeKey,
               `P${ev.actor} ${structureLabel(ev.itemType)}`
             );
-            const yValue = { solar:0, reactor:1, habitat:2, rover:3 }[ev.itemType] ?? 0;
+            const yValue = { solar:0, reactor:1, habitat:2, rover:3, pad:4 }[ev.itemType] ?? 0;
             series.data[frameIdx] = yValue;
           }
         }
@@ -4024,14 +4124,15 @@ export default function App() {
       makePlot("power-supplied-over-time", "Cumulative Power Supplied Over Time", generatorPowerSeries, { yLabel:"Power units", legendCols: 4 }),
       makePlot("p1-power-supply-allocation", "Cumulative P1 Power Supply Over Time", p1SupplyAllocationSeries, { yLabel:"Power units", legendCols: 2 }),
       makePlot("p2-power-supply-allocation", "Cumulative P2 Power Supply Over Time", p2SupplyAllocationSeries, { yLabel:"Power units", legendCols: 2 }),
-      makePlot("ice-by-rover", "Cumulative Ice Extracted Over Time By Rover", roverIceSeries, { yLabel:"kg", legendCols: 4 }),
+      makePlot("ice-by-rover", "Cumulative Ice Mined Over Time By Rover", roverIceSeries, { yLabel:"kg", legendCols: 4 }),
       makePlot("ice-delivered-by-rover", "Cumulative Ice Delivered Over Time By Rover", roverDeliveredSeries, { yLabel:"kg", legendCols: 4 }),
       makePlot("movement-by-rover", "Cumulative Movement By Rover", roverMoveSeries, { yLabel:"km", legendCols: 4 }),
       makePlot("rover-state-over-time", "Rover State Over Time", roverStateSeries, { legendCols: 4, categoricalTicks: STATUS_ORDER.map(key => STATUS_INFO[key]?.label || key) }),
       makePlot("asset-purchases", "Asset Purchases", purchaseSeries, { legendCols: 3, categoricalTicks: purchaseLabels, pointOnly: true }),
       makePlot("resupply-purchases", "Resupply Purchases", resupplySeries, { legendCols: 2, categoricalTicks: resupplyLabels }),
       makePlot("structure-health-over-time", "Structure Health Over Time", structureHealthSeries, { yLabel:"Health %", legendCols: 4, tickFormatter:(v)=>`${Math.round(v)}%` }),
-      makePlot("budget-over-time", "Budget Over Time", budgetSeries, { yLabel:"credits", legendCols: 2, tickFormatter:(v)=>`${Math.round(v)}cr` }),
+      makePlot("budget-over-time", "Remaining Credits Over Time", budgetSeries, { yLabel:"credits", legendCols: 2, tickFormatter:(v)=>`${Math.round(v)}` }),
+      makePlot("cumulative-credits-over-time", "Cumulative Credits Over Time", cumCreditsSeries, { yLabel:"credits", legendCols: 2, tickFormatter:(v)=>`${Math.round(v)}` }),
       makePlot("score-over-time", "Score Over Time", scoreSeries, { legendCols: 2 }),
       makePlot("violations-over-time", "Safety Zone Violations Over Time", violationSeries, { legendCols: 2 }),
       makePlot("shared-status", "Shared Grid Status Over Time", sharedSeries, { booleanPlot: true, legendCols: 1 }),
