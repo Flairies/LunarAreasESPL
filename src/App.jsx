@@ -1,4 +1,6 @@
-import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+﻿import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import GIF from "gif.js";
+import gifWorkerUrl from "gif.js/dist/gif.worker.js?url";
 
 // ── Embedded map data ─────────────────────────────────────────────────────────
 const MAP_SRC     = "/basemap.jpg";
@@ -236,6 +238,9 @@ const getTotalMapIce = (po = {}) => {
   return CRATER_DATA.reduce((sum, crater) => sum + getCraterIceCapacity(crater, depRate), 0);
 };
 const DEPLETION_END_THRESHOLD = 0.005;
+const GIF_FPS = 2;
+const GIF_FRAME_DELAY = Math.round(1000 / GIF_FPS);
+const GIF_OVERLAY_HEIGHT = 78;
 
 // ── Player factory ────────────────────────────────────────────────────────────
 function makePlayer(base, id, color, opts = {}) {
@@ -257,8 +262,11 @@ function makePlayer(base, id, color, opts = {}) {
     returning: false,
     pendingDeliveries: [], // { id, type, padIdx } — waiting at a landing pad
     carrying: null,        // { id, type } — structure rover is transporting
-    diplomacy: 0,          // national diplomacy score (-100 = Infamous, 100 = Amicable)
+    scoreAdjustments: 0,
+    safetyViolations: 0,
     generatorRangeEntries: {}, // per-generator arrival timestamps for charging tie breaks
+    generatorSupplyTotals: {},
+    generatorSupplyByRecipient: { 1: 0, 2: 0 },
     structureHealth: {     // health per structure type: { panels:[], reactors:[], habitats:[], extraRovers:[], landingPads:[] }
       panels: [], reactors: [], habitats: [], extraRovers: [], landingPads: [],
     },
@@ -324,10 +332,6 @@ function calcMilScore(milStock) {
   return Math.max(0.1, milStock / 20);
 }
 
-function isPlayerActiveForDiplomacy(player, globalDay) {
-  return !!player && player.active !== false && globalDay >= (player.arrivalDay ?? 0);
-}
-
 function activatePlayer(player) {
   if (!player || player.active) return player;
   return {
@@ -362,6 +366,8 @@ function allocateDailyPower(players, globalDay, sharedGrid=false) {
         landingPads: [...(player.structureHealth?.landingPads || (player.landingPads || []).map(() => 1.0))],
       },
       generatorRangeEntries: { ...(player.generatorRangeEntries || {}) },
+      generatorSupplyTotals: { ...(player.generatorSupplyTotals || {}) },
+      generatorSupplyByRecipient: { 1: player.generatorSupplyByRecipient?.[1] || 0, 2: player.generatorSupplyByRecipient?.[2] || 0 },
     };
   });
 
@@ -405,7 +411,11 @@ function allocateDailyPower(players, globalDay, sharedGrid=false) {
       );
 
       const chosen = candidates[0];
-      chosen.target.setPower(Math.min(chosen.target.capacity, chosen.currentPower + output));
+      const supplied = Math.min(output, Math.max(0, chosen.target.capacity - chosen.currentPower));
+      chosen.target.setPower(Math.min(chosen.target.capacity, chosen.currentPower + supplied));
+      generator.owner.generatorSupplyTotals[generatorId] = (generator.owner.generatorSupplyTotals[generatorId] || 0) + supplied;
+      const recipientId = Number(String(chosen.target.id || "").match(/^p(\d+)-/)?.[1] || generator.owner.playerId);
+      generator.owner.generatorSupplyByRecipient[recipientId] = (generator.owner.generatorSupplyByRecipient[recipientId] || 0) + supplied;
     }
   };
 
@@ -462,6 +472,8 @@ function allocateDailyPower(players, globalDay, sharedGrid=false) {
       habitatPower: state.habitatPower,
       extraRovers: state.extraRovers,
       generatorRangeEntries: state.generatorRangeEntries,
+      generatorSupplyTotals: state.generatorSupplyTotals,
+      generatorSupplyByRecipient: state.generatorSupplyByRecipient,
     };
   });
 }
@@ -701,6 +713,8 @@ export default function App() {
   const canvasRef = useRef(null);
   const mapRef    = useRef(null);
   const illumRef  = useRef(null);
+  const liveTimelineKeyRef = useRef("");
+  const plotCanvasRefs = useRef({});
   const [mapLoaded, setMapLoaded] = useState(false);
   const [illumLoaded, setIllumLoaded] = useState(false);
   const [dataReady, setDataReady] = useState(false);
@@ -756,7 +770,7 @@ export default function App() {
   const [addingWaypoint, setAddingWaypoint] = useState(false);
   const [lastEvents, setLastEvents]     = useState([]);   // events from last step for toast display
   const [selectedBuild, setSelectedBuild] = useState([null, null]); // per-player selected build type
-  const [selectedDiplomacy, setSelectedDiplomacy] = useState([null, null]); // per-player selected diplomacy action
+  const [selectedDiplomacy, setSelectedDiplomacy] = useState([null, null]); // per-player grid-sharing action
   const [selectedPad, setSelectedPad]     = useState([0, 0]);       // per-player selected landing pad index
   const [mapLayer, setMapLayer]           = useState("base");        // active map overlay
   const [powerGridState, setPowerGridState] = useState({ mode:"independent", offeredBy:null, offeredTo:null });
@@ -768,6 +782,10 @@ export default function App() {
   const [replayFrameIndex, setReplayFrameIndex] = useState(0);
   const [replayPlaying, setReplayPlaying] = useState(false);
   const [replayLoading, setReplayLoading] = useState(false);
+  const [liveTimeline, setLiveTimeline] = useState([]);
+  const [gifExporting, setGifExporting] = useState(false);
+  const [showPlots, setShowPlots] = useState(false);
+  const [separatePlotsOpen, setSeparatePlotsOpen] = useState({});
   const [undoStack, setUndoStack] = useState([]);
 
   useEffect(() => {
@@ -825,6 +843,8 @@ export default function App() {
     const entries = lastEvents.map(ev => ({
       ts, round, day, globalDay,
       type: ev.type,
+      actor: ev.actor,
+      roverId: ev.roverId,
       kg: ev.kg,
       craterIdx: ev.craterIdx,
       itemType: ev.itemType,
@@ -849,6 +869,26 @@ export default function App() {
     const timer = setTimeout(() => loadReplayFrame(replayRun, replayFrameIndex + 1), 420);
     return () => clearTimeout(timer);
   }, [replayRun, replayPlaying, replayFrameIndex]);
+
+  useEffect(() => {
+    if (!mapLoaded || replayRun || batchRunning || gifExporting || !p1) return;
+    if (phase !== PHASE.PLAYING && phase !== PHASE.DONE) return;
+    const key = [
+      phase, round, day, globalDay, missionLog.length,
+      p1Done ? 1 : 0, p2Done ? 1 : 0, !!p2 ? 1 : 0,
+      powerGridState.mode, powerGridState.offeredBy ?? "-", powerGridState.offeredTo ?? "-",
+    ].join("|");
+    if (liveTimelineKeyRef.current === key) return;
+    liveTimelineKeyRef.current = key;
+    setLiveTimeline(prev => {
+      if (prev.length && prev[prev.length - 1]?.__key === key) return prev;
+      const frame = { ...snapshotLiveFrame(), __key: key };
+      return [...prev, frame];
+    });
+  }, [
+    mapLoaded, replayRun, batchRunning, gifExporting, p1, p2, phase,
+    round, day, globalDay, missionLog.length, p1Done, p2Done, powerGridState,
+  ]);
 
   // ── Canvas rendering ─────────────────────────────────────────────────────
   const draw = useCallback(() => {
@@ -1530,6 +1570,7 @@ export default function App() {
       { ...s, waypoints:[...(s.waypoints||[])], mineMap:{...s.mineMap} },
       newHealth, gDay, po
     );
+    result.events = (result.events || []).map(ev => ({ ...ev, roverId: 1 }));
 
     // Simulate each extra rover independently, sharing the same habitat/structure state
     const newExtraRovers = (s.extraRovers||[]).map((er, erIdx) => {
@@ -1544,6 +1585,7 @@ export default function App() {
         mineMap: result.mineMap,
       };
       const erResult = simDay(erState, newHealth, gDay, po);
+      erResult.events = (erResult.events || []).map(ev => ({ ...ev, roverId: erIdx + 2 }));
       return {
         x: erResult.x, y: erResult.y,
         ice: erResult.ice,
@@ -1658,6 +1700,7 @@ export default function App() {
       const _HOSTILE_DECAY  = physOverrides.HOSTILE_DECAY  != null ? physOverrides.HOSTILE_DECAY  : HOSTILE_DECAY;
       const defMul = MIL_DEFENSE_SCALE + (1 - MIL_DEFENSE_SCALE) * (1 / Math.max(0.1, defenseMil));
       const hostileDecayEff = _HOSTILE_DECAY * attackMil * defMul;
+      let violationCount = 0;
       for (const { key, list, type } of structTypes) {
         const healths = [...(sh[key] || list.map(() => 1.0))];
         for (let idx = 0; idx < list.length; idx++) {
@@ -1666,12 +1709,22 @@ export default function App() {
           const generatorSharedSafe = sharedGridActive && (type === "solar" || type === "reactor");
           const inZone = !generatorSharedSafe && d2(enemyPos, struct) < radius;
           const decay = inZone ? hostileDecayEff : _PASSIVE_DECAY;
-          if (inZone) damageDone += hostileDecayEff;
+          if (inZone) {
+            damageDone += hostileDecayEff;
+            violationCount += 1;
+          }
           healths[idx] = Math.max(0, (healths[idx] ?? 1.0) - decay);
         }
         newSH[key] = healths;
       }
-      return { updatedOwner: { ...owner, structureHealth: newSH }, damageDone };
+      return {
+        updatedOwner: {
+          ...owner,
+          structureHealth: newSH,
+          safetyViolations: (owner.safetyViolations ?? 0) + violationCount,
+        },
+        damageDone,
+      };
     };
 
     const mil1 = np1.milScore ?? 1.0;
@@ -1685,30 +1738,19 @@ export default function App() {
     const fnp1base = dnp1;
     const fnp2base = dnp2;
 
-    // ── Diplomacy updates ──────────────────────────────────────────────────
-    const DIPLOMACY_PASSIVE_GAIN = 0.5;   // per turn, natural recovery
-    const DIPLOMACY_DAMAGE_PENALTY = 80;  // 4× — every harmful act has real diplomatic weight
-    const diplomacyRecoveryEnabled = isPlayerActiveForDiplomacy(fnp1base, globalDay) && isPlayerActiveForDiplomacy(fnp2base, globalDay);
-    const passiveGain = diplomacyRecoveryEnabled ? DIPLOMACY_PASSIVE_GAIN : 0;
-    let fnp1 = { ...fnp1base, diplomacy: Math.min(100, Math.max(-100,
-      (fnp1base.diplomacy ?? 0) + passiveGain - dmgByP1 * DIPLOMACY_DAMAGE_PENALTY
-    )) };
-    let fnp2 = fnp2base ? { ...fnp2base, diplomacy: Math.min(100, Math.max(-100,
-      (fnp2base.diplomacy ?? 0) + passiveGain - dmgByP2 * DIPLOMACY_DAMAGE_PENALTY
-    )) } : null;
+    // ── Direct score updates now come from safety violations and grid actions.
+    let fnp1 = { ...fnp1base };
+    let fnp2 = fnp2base ? { ...fnp2base } : null;
 
-    if (p2) {
-      const p1ReactorPlacements = evs1.filter(ev => ev.type === "place" && ev.itemType === "reactor");
-      const p2ReactorPlacements = evs2.filter(ev => ev.type === "place" && ev.itemType === "reactor");
-      for (const ev of p1ReactorPlacements) fnp1 = applyReactorPlacementPenalty(fnp1, fnp2, ev.x, ev.y);
-      for (const ev of p2ReactorPlacements) fnp2 = applyReactorPlacementPenalty(fnp2, fnp1, ev.x, ev.y);
-    }
 
     const newGlobalDay = globalDay + 1;
     const newDay = day + 1;
     let newRound = round;
     let newCR = [...claimR];
-    const events = [...evs1, ...evs2];
+    const events = [
+      ...evs1.map(ev => ({ ...ev, actor: 1 })),
+      ...evs2.map(ev => ({ ...ev, actor: 2 })),
+    ];
     setLastEvents(events);
 
     let roundEnded = false;
@@ -1807,11 +1849,7 @@ export default function App() {
   // ── UI helpers ───────────────────────────────────────────────────────────
   // Apply landing damage to every enemy structure whose safety zone contains
   // the landing point (lx, ly). Used by both click-placed structures and
-  // rover deployments at base. Each hit also costs the attacker diplomacy,
-  // matching the per-unit-damage penalty rate used by passive rover decay
-  // (20 diplomacy per unit of HP destroyed).
-  const LANDING_DIPLOMACY_PENALTY = 80;
-  const REACTOR_DIPLOMACY_PENALTY = 12;
+  // rover deployments at base.
   const landingImpact = (pi, lx, ly) => {
     const enemyPi = pi === 0 ? 1 : 0;
     const enemyP = enemyPi === 0 ? p1 : p2;
@@ -1844,10 +1882,6 @@ export default function App() {
     }
     if (totalDamage > 0) {
       setEnemy(prev => prev ? { ...prev, structureHealth: eSh } : prev);
-      const diplomacyHit = totalDamage * LANDING_DIPLOMACY_PENALTY;
-      setSelf(prev => prev ? { ...prev,
-        diplomacy: Math.max(-100, Math.min(100, (prev.diplomacy ?? 0) - diplomacyHit))
-      } : prev);
     }
   };
 
@@ -1874,10 +1908,7 @@ export default function App() {
   const applyReactorPlacementPenalty = (playerState, enemyState, x, y) => {
     const nearby = countNearbyEnemyStructures(enemyState, x, y);
     if (nearby <= 0 || !playerState) return playerState;
-    return {
-      ...playerState,
-      diplomacy: Math.max(-100, Math.min(100, (playerState.diplomacy ?? 0) - nearby * REACTOR_DIPLOMACY_PENALTY)),
-    };
+    return playerState;
   };
 
   const appendMissionLog = (entry) => {
@@ -1914,11 +1945,11 @@ export default function App() {
     return [{ type: "open", label: `Open Power Grid to P${otherId}` }];
   };
 
-  const applyDiplomacyDelta = (pi, delta) => {
+  const applyScoreDelta = (pi, delta) => {
     const setter = pi === 0 ? setP1 : setP2;
     setter(player => player ? {
       ...player,
-      diplomacy: Math.max(-100, Math.min(100, (player.diplomacy ?? 0) + delta)),
+      scoreAdjustments: (player.scoreAdjustments ?? 0) + delta,
     } : player);
   };
 
@@ -1939,16 +1970,16 @@ export default function App() {
 
     if (action === "open" && powerGridState.mode !== "shared") {
       setPowerGridState({ mode:"offered", offeredBy: actorId, offeredTo: otherId });
-      applyDiplomacyDelta(pi, 15);
-      appendMissionLog({ type:"diplomacy", actor: actorId, other: otherId, label: `P${actorId} opened its power grid to P${otherId}` });
+      applyScoreDelta(pi, 30);
+      appendMissionLog({ type:"grid", actor: actorId, other: otherId, label: `P${actorId} opened its power grid to P${otherId}` });
     } else if (action === "join" && powerGridState.mode === "offered" && powerGridState.offeredTo === actorId) {
       setPowerGridState({ mode:"shared", offeredBy: powerGridState.offeredBy, offeredTo: actorId });
-      applyDiplomacyDelta(pi, 10);
-      appendMissionLog({ type:"diplomacy", actor: actorId, other: powerGridState.offeredBy, label: `P${actorId} joined P${powerGridState.offeredBy}'s power grid` });
+      applyScoreDelta(pi, 20);
+      appendMissionLog({ type:"grid", actor: actorId, other: powerGridState.offeredBy, label: `P${actorId} joined P${powerGridState.offeredBy}'s power grid` });
     } else if (action === "decouple" && powerGridState.mode === "shared" && !gridSharingPermanent) {
       setPowerGridState({ mode:"independent", offeredBy: null, offeredTo: null });
-      applyDiplomacyDelta(pi, -25);
-      appendMissionLog({ type:"diplomacy", actor: actorId, other: otherId, label: `P${actorId} decoupled the shared power grid` });
+      applyScoreDelta(pi, -20);
+      appendMissionLog({ type:"grid", actor: actorId, other: otherId, label: `P${actorId} decoupled the shared power grid` });
     }
 
     setSelectedDiplomacy([null, null]);
@@ -2118,11 +2149,11 @@ export default function App() {
     const data = {
       meta: { round, day, globalDay, totalRounds, simMode, timestamp: new Date().toISOString() },
       p1: p1 ? { iceDeposited: p1.iceDeposited, assetPts: p1.assetPts, budget: p1.budget,
-                  econ: p1.econ, rdAccum: p1.rdAccum, milStock: p1.milStock, diplomacy: p1.diplomacy,
+                  econ: p1.econ, rdAccum: p1.rdAccum, milStock: p1.milStock,
                   panels: p1.panels.length, reactors: (p1.reactors||[]).length, habitats: (p1.habitats||[]).length,
                   rovers: 1 + (p1.extraRovers||[]).length, pads: (p1.landingPads||[]).length } : null,
       p2: p2 ? { iceDeposited: p2.iceDeposited, assetPts: p2.assetPts, budget: p2.budget,
-                  econ: p2.econ, rdAccum: p2.rdAccum, milStock: p2.milStock, diplomacy: p2.diplomacy,
+                  econ: p2.econ, rdAccum: p2.rdAccum, milStock: p2.milStock,
                   panels: p2.panels.length, reactors: (p2.reactors||[]).length, habitats: (p2.habitats||[]).length,
                   rovers: 1 + (p2.extraRovers||[]).length, pads: (p2.landingPads||[]).length } : null,
       history, missionLog, annotations,
@@ -2158,6 +2189,10 @@ export default function App() {
     setReplayFrameIndex(0);
     setReplayPlaying(false);
     setReplayLoading(false);
+    setLiveTimeline([]);
+    liveTimelineKeyRef.current = "";
+    setShowPlots(false);
+    setSeparatePlotsOpen({});
     setMissionLog([]); setAnnotations([]); setAnnotating(false); setAnnotNote("");
     setAutoAdvance(false); setShowLog(false); setShowParams(false); setShowAnalytics(false);
   };
@@ -2206,13 +2241,15 @@ export default function App() {
       depositLog: [...(player.depositLog || [])],
       alloc: { ...(player.alloc || {}) },
       generatorRangeEntries: JSON.parse(JSON.stringify(player.generatorRangeEntries || {})),
+      generatorSupplyTotals: { ...(player.generatorSupplyTotals || {}) },
+      generatorSupplyByRecipient: { 1: player.generatorSupplyByRecipient?.[1] || 0, 2: player.generatorSupplyByRecipient?.[2] || 0 },
       botMemory: player.botMemory ? JSON.parse(JSON.stringify(player.botMemory)) : undefined,
     };
   }
 
   function scorePlayerState(player) {
     if (!player) return 0;
-    return (player.iceDeposited ?? 0) + (player.assetPts ?? 0) * 15 + (player.diplomacy ?? 0) * 3;
+    return (player.iceDeposited ?? 0) + (player.assetPts ?? 0) * 15 + (player.scoreAdjustments ?? 0) - (player.safetyViolations ?? 0) * 25;
   }
 
   function structureCounts(player) {
@@ -2239,6 +2276,38 @@ export default function App() {
       logLength: (sim.missionLog || []).length,
       phase: sim.phase || PHASE.PLAYING,
     };
+  }
+
+  function snapshotLiveFrame() {
+    return {
+      round,
+      day,
+      globalDay,
+      claimR: [...claimR],
+      powerGridState: { ...powerGridState },
+      p1: clonePlayerState(p1),
+      p2: clonePlayerState(p2),
+      craterHealth: Array.from(craterHealth || []),
+      history: history.map(h => ({ ...h })),
+      logLength: missionLog.length,
+      phase,
+    };
+  }
+
+  function applyFrameSnapshot(frame, logSource = []) {
+    if (!frame) return;
+    setP1(clonePlayerState(frame.p1));
+    setP2(clonePlayerState(frame.p2));
+    setCraterHealth(new Float32Array(frame.craterHealth || []));
+    setRound(frame.round);
+    setDay(frame.day);
+    setGlobalDay(frame.globalDay);
+    setClaimR([...(frame.claimR || [80, 80])]);
+    setPowerGridState({ ...(frame.powerGridState || { mode:"independent", offeredBy:null, offeredTo:null }) });
+    setHistory((frame.history || []).map(h => ({ ...h })));
+    setLastEvents([]);
+    setMissionLog((logSource || []).slice(0, frame.logLength || 0).map(ev => ({ ...ev })));
+    setPhase(frame.phase === PHASE.DONE ? PHASE.DONE : PHASE.PLAYING);
   }
 
   function getUndoSegmentKey(snapshot = {}) {
@@ -2355,10 +2424,7 @@ export default function App() {
   function applyPureReactorPlacementPenalty(playerState, enemyState, x, y) {
     const nearby = countNearbyEnemyStructuresState(enemyState, x, y);
     if (nearby <= 0 || !playerState) return playerState;
-    return {
-      ...playerState,
-      diplomacy: Math.max(-100, Math.min(100, (playerState.diplomacy ?? 0) - nearby * REACTOR_DIPLOMACY_PENALTY)),
-    };
+    return playerState;
   }
 
   function applyPureLandingImpact(players, actorIdx, lx, ly) {
@@ -2392,12 +2458,7 @@ export default function App() {
       eSh[k] = arr;
     }
     nextPlayers[enemyIdx] = { ...enemyP, structureHealth: eSh };
-    if (totalDamage > 0) {
-      nextPlayers[actorIdx] = {
-        ...actorP,
-        diplomacy: Math.max(-100, Math.min(100, (actorP.diplomacy ?? 0) - totalDamage * LANDING_DIPLOMACY_PENALTY)),
-      };
-    }
+    if (totalDamage > 0) nextPlayers[actorIdx] = { ...actorP };
     return nextPlayers;
   }
 
@@ -2789,7 +2850,7 @@ export default function App() {
     const keepReplayData = sim.keepReplayData !== false;
     if (action === "open" && powerGrid.mode !== "shared") {
       powerGrid = { mode:"offered", offeredBy: actorId, offeredTo: otherId };
-      actor.diplomacy = Math.max(-100, Math.min(100, (actor.diplomacy ?? 0) + 15));
+      actor.scoreAdjustments = (actor.scoreAdjustments ?? 0) + 30;
       flags.offers = (flags.offers || 0) + 1;
       return {
         ...sim,
@@ -2797,12 +2858,12 @@ export default function App() {
         p2: players[1],
         powerGridState: powerGrid,
         batchFlags: flags,
-        missionLog: keepReplayData ? [...(sim.missionLog || []), { round:sim.round, day:sim.day, globalDay:sim.globalDay, type:"diplomacy", label:`P${actorId} opened its power grid to P${otherId}` }] : (sim.missionLog || []),
+        missionLog: keepReplayData ? [...(sim.missionLog || []), { round:sim.round, day:sim.day, globalDay:sim.globalDay, type:"grid", label:`P${actorId} opened its power grid to P${otherId}` }] : (sim.missionLog || []),
       };
     }
     if (action === "join" && powerGrid.mode === "offered" && powerGrid.offeredTo === actorId) {
       powerGrid = { mode:"shared", offeredBy: powerGrid.offeredBy, offeredTo: actorId };
-      actor.diplomacy = Math.max(-100, Math.min(100, (actor.diplomacy ?? 0) + 10));
+      actor.scoreAdjustments = (actor.scoreAdjustments ?? 0) + 20;
       flags.joins = (flags.joins || 0) + 1;
       return {
         ...sim,
@@ -2810,12 +2871,12 @@ export default function App() {
         p2: players[1],
         powerGridState: powerGrid,
         batchFlags: flags,
-        missionLog: keepReplayData ? [...(sim.missionLog || []), { round:sim.round, day:sim.day, globalDay:sim.globalDay, type:"diplomacy", label:`P${actorId} joined P${powerGrid.offeredBy}'s power grid` }] : (sim.missionLog || []),
+        missionLog: keepReplayData ? [...(sim.missionLog || []), { round:sim.round, day:sim.day, globalDay:sim.globalDay, type:"grid", label:`P${actorId} joined P${powerGrid.offeredBy}'s power grid` }] : (sim.missionLog || []),
       };
     }
     if (action === "decouple" && powerGrid.mode === "shared" && !sim.permanentGridSharing) {
       powerGrid = { mode:"independent", offeredBy:null, offeredTo:null };
-      actor.diplomacy = Math.max(-100, Math.min(100, (actor.diplomacy ?? 0) - 25));
+      actor.scoreAdjustments = (actor.scoreAdjustments ?? 0) - 20;
       flags.decouples = (flags.decouples || 0) + 1;
       return {
         ...sim,
@@ -2823,7 +2884,7 @@ export default function App() {
         p2: players[1],
         powerGridState: powerGrid,
         batchFlags: flags,
-        missionLog: keepReplayData ? [...(sim.missionLog || []), { round:sim.round, day:sim.day, globalDay:sim.globalDay, type:"diplomacy", label:`P${actorId} decoupled the shared power grid` }] : (sim.missionLog || []),
+        missionLog: keepReplayData ? [...(sim.missionLog || []), { round:sim.round, day:sim.day, globalDay:sim.globalDay, type:"grid", label:`P${actorId} decoupled the shared power grid` }] : (sim.missionLog || []),
       };
     }
     return sim;
@@ -2861,17 +2922,17 @@ export default function App() {
     const actorGenerators = (actor.panels || []).length + (actor.reactors || []).length;
     if (sim.powerGridState.mode === "shared") {
       if (sim.permanentGridSharing) return null;
-      if (otherBenefit - selfBenefit >= 2 && (actor.diplomacy ?? 0) > -20) return "decouple";
+      if (otherBenefit - selfBenefit >= 2) return "decouple";
       return null;
     }
     if (sim.powerGridState.mode === "offered") {
-      if (sim.powerGridState.offeredTo === actor.id && (selfBenefit >= 1 || actorGenerators === 0 || (actor.diplomacy ?? 0) < 10)) {
+      if (sim.powerGridState.offeredTo === actor.id && (selfBenefit >= 1 || actorGenerators === 0)) {
         return "join";
       }
       return null;
     }
     if (actorGenerators > 0 && otherBenefit >= 1) {
-      if (actor.id === 1 || (actor.diplomacy ?? 0) < 15 || scorePlayerState(actor) >= scorePlayerState(other) - 25) {
+      if (actor.id === 1 || scorePlayerState(actor) >= scorePlayerState(other) - 25) {
         return "open";
       }
     }
@@ -3045,6 +3106,7 @@ export default function App() {
       const _HOSTILE_DECAY = physOverrides.HOSTILE_DECAY != null ? physOverrides.HOSTILE_DECAY : HOSTILE_DECAY;
       const defMul = MIL_DEFENSE_SCALE + (1 - MIL_DEFENSE_SCALE) * (1 / Math.max(0.1, defenseMil));
       const hostileDecayEff = _HOSTILE_DECAY * attackMil * defMul;
+      let violationCount = 0;
       for (const { key, list, type } of structTypes) {
         const healths = [...(sh[key] || list.map(() => 1.0))];
         for (let idx = 0; idx < list.length; idx++) {
@@ -3053,12 +3115,22 @@ export default function App() {
           const generatorSharedSafe = sharedGridActive && (type === "solar" || type === "reactor");
           const inZone = !generatorSharedSafe && d2(enemyPos, struct) < radius;
           const decay = inZone ? hostileDecayEff : _PASSIVE_DECAY;
-          if (inZone) damageDone += hostileDecayEff;
+          if (inZone) {
+            damageDone += hostileDecayEff;
+            violationCount += 1;
+          }
           healths[idx] = Math.max(0, (healths[idx] ?? 1.0) - decay);
         }
         newSH[key] = healths;
       }
-      return { updatedOwner: { ...owner, structureHealth: newSH }, damageDone };
+      return {
+        updatedOwner: {
+          ...owner,
+          structureHealth: newSH,
+          safetyViolations: (owner.safetyViolations ?? 0) + violationCount,
+        },
+        damageDone,
+      };
     };
 
     const mil1 = np1.milScore ?? 1.0;
@@ -3069,32 +3141,24 @@ export default function App() {
     const { updatedOwner: dnp2, damageDone: dmgByP1 } = sim.p2
       ? applyDecayToOwner(np2, { x: np1.x, y: np1.y }, mil1, mil2)
       : { updatedOwner: np2, damageDone: 0 };
-    const diplomacyRecoveryEnabled = isPlayerActiveForDiplomacy(dnp1, sim.globalDay) && isPlayerActiveForDiplomacy(dnp2, sim.globalDay);
-    const passiveGain = diplomacyRecoveryEnabled ? 0.5 : 0;
-    let fnp1 = {
-      ...dnp1,
-      diplomacy: Math.min(100, Math.max(-100, (dnp1.diplomacy ?? 0) + passiveGain - dmgByP1 * 80)),
-    };
-    let fnp2 = dnp2 ? {
-      ...dnp2,
-      diplomacy: Math.min(100, Math.max(-100, (dnp2.diplomacy ?? 0) + passiveGain - dmgByP2 * 80)),
-    } : null;
+    let fnp1 = { ...dnp1 };
+    let fnp2 = dnp2 ? { ...dnp2 } : null;
 
-    if (sim.p2) {
-      const p1ReactorPlacements = evs1.filter(ev => ev.type === "place" && ev.itemType === "reactor");
-      const p2ReactorPlacements = evs2.filter(ev => ev.type === "place" && ev.itemType === "reactor");
-      for (const ev of p1ReactorPlacements) fnp1 = applyPureReactorPlacementPenalty(fnp1, fnp2, ev.x, ev.y);
-      for (const ev of p2ReactorPlacements) fnp2 = applyPureReactorPlacementPenalty(fnp2, fnp1, ev.x, ev.y);
-    }
-
-    const events = [...evs1, ...evs2];
+    const events = [
+      ...evs1.map(ev => ({ ...ev, actor: 1 })),
+      ...evs2.map(ev => ({ ...ev, actor: 2 })),
+    ];
     const mined1 = evs1.filter(e => e.type === "mine").map(e => e.craterIdx);
     const mined2 = evs2.filter(e => e.type === "mine").map(e => e.craterIdx);
     const contestedToday = mined1.some(ci => mined2.includes(ci));
     const missionLog = keepReplayData
       ? [
           ...(sim.missionLog || []),
-          ...events.map(ev => ({ round: sim.round, day: sim.day, globalDay: sim.globalDay, type: ev.type, kg: ev.kg, craterIdx: ev.craterIdx, itemType: ev.itemType })),
+          ...events.map(ev => ({
+            round: sim.round, day: sim.day, globalDay: sim.globalDay,
+            type: ev.type, actor: ev.actor, roverId: ev.roverId,
+            kg: ev.kg, craterIdx: ev.craterIdx, itemType: ev.itemType
+          })),
         ]
       : (sim.missionLog || []);
 
@@ -3238,10 +3302,10 @@ export default function App() {
         score1, score2,
         ice1: sim.p1?.iceDeposited ?? 0,
         ice2: sim.p2?.iceDeposited ?? 0,
-        dip1: sim.p1?.diplomacy ?? 0,
-        dip2: sim.p2?.diplomacy ?? 0,
         ap1: sim.p1?.assetPts ?? 0,
         ap2: sim.p2?.assetPts ?? 0,
+        vio1: sim.p1?.safetyViolations ?? 0,
+        vio2: sim.p2?.safetyViolations ?? 0,
         counts1: structureCounts(sim.p1),
         counts2: structureCounts(sim.p2),
         offers: sim.batchFlags.offers || 0,
@@ -3274,10 +3338,10 @@ export default function App() {
       avgScore2: avg(r => r.summary.score2),
       avgIce1: avg(r => r.summary.ice1),
       avgIce2: avg(r => r.summary.ice2),
-      avgDip1: avg(r => r.summary.dip1),
-      avgDip2: avg(r => r.summary.dip2),
       avgAp1: avg(r => r.summary.ap1),
       avgAp2: avg(r => r.summary.ap2),
+      avgVio1: avg(r => r.summary.vio1),
+      avgVio2: avg(r => r.summary.vio2),
       avgDepleted: avg(r => r.summary.cratersDepleted),
       avgSharedDays: avg(r => r.summary.sharedDays),
       avgContestedDays: avg(r => r.summary.contestedDays),
@@ -3294,18 +3358,7 @@ export default function App() {
     const frame = run?.frames?.[frameIdx];
     if (!frame) return;
     setReplayFrameIndex(frameIdx);
-    setP1(clonePlayerState(frame.p1));
-    setP2(clonePlayerState(frame.p2));
-    setCraterHealth(new Float32Array(frame.craterHealth));
-    setRound(frame.round);
-    setDay(frame.day);
-    setGlobalDay(frame.globalDay);
-    setClaimR([...frame.claimR]);
-    setPowerGridState({ ...frame.powerGridState });
-    setHistory(frame.history.map(h => ({ ...h })));
-    setLastEvents([]);
-    setMissionLog(run.missionLog.slice(0, frame.logLength).map(ev => ({ ...ev })));
-    setPhase(frame.phase === PHASE.DONE ? PHASE.DONE : PHASE.PLAYING);
+    applyFrameSnapshot(frame, run.missionLog || []);
   }
 
   async function watchReplayRun(run) {
@@ -3366,6 +3419,827 @@ export default function App() {
     setBatchRunning(false);
   }
 
+  const waitForPaint = async (frames = 2) => {
+    for (let i = 0; i < frames; i++) {
+      await new Promise(resolve => requestAnimationFrame(() => resolve()));
+    }
+  };
+
+  const gridStatusLabel = (gridState) => {
+    if (gridState?.mode === "shared") return "GRID SHARED";
+    if (gridState?.mode === "offered" && gridState?.offeredBy && gridState?.offeredTo) {
+      return `GRID OFFER P${gridState.offeredBy}\u2192P${gridState.offeredTo}`;
+    }
+    return "GRID INDEPENDENT";
+  };
+
+  const infrastructureInline = (player) => {
+    const counts = structureCounts(player);
+    return `🏠×${counts.habitats} ☀×${counts.panels} ☢×${counts.reactors} 🚗×${counts.rovers} 🛬×${counts.pads}`;
+  };
+
+  const padNum = (value, width=4) => String(Math.round(value ?? 0)).padStart(width, " ");
+
+  const composeGifFrame = (frame) => {
+    const mapCanvas = canvasRef.current;
+    const composed = document.createElement("canvas");
+    composed.width = W;
+    composed.height = H + GIF_OVERLAY_HEIGHT;
+    const ctx = composed.getContext("2d");
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, composed.width, composed.height);
+    ctx.drawImage(mapCanvas, 0, 0, W, H);
+
+    const overlayY = H;
+    ctx.fillStyle = "#020914";
+    ctx.fillRect(0, overlayY, W, GIF_OVERLAY_HEIGHT);
+    ctx.strokeStyle = "rgba(90,140,200,0.18)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(0, overlayY + 0.5);
+    ctx.lineTo(W, overlayY + 0.5);
+    ctx.stroke();
+
+    const p1Frame = frame.p1;
+    const p2Frame = frame.p2;
+    const score1Frame = Math.round(scorePlayerState(p1Frame));
+    const score2Frame = Math.round(scorePlayerState(p2Frame));
+    const totalMapIce = getTotalMapIce(physOverrides);
+    const totalExtracted = CRATER_DATA.reduce((sum, crater, ci) => {
+      const remaining = frame.craterHealth?.[ci] ?? 1;
+      return sum + getCraterIceCapacity(crater, physOverrides.DEPLETION_RATE != null ? physOverrides.DEPLETION_RATE : DEPLETION_RATE) * (1 - remaining);
+    }, 0);
+    const extractionPct = (totalExtracted / Math.max(1, totalMapIce)) * 100;
+    const leftMaxWidth = W - 250;
+    const p2ArrivalDays = scenarioPreset === "unevenArrival" && !p2Frame && frame.globalDay < arrivalDelay
+      ? Math.max(0, arrivalDelay - frame.globalDay)
+      : null;
+
+    ctx.textBaseline = "top";
+    ctx.font = "12px 'Orbitron', 'JetBrains Mono', monospace";
+    ctx.fillStyle = "#466882";
+    ctx.fillText("PSR ICE MINING MISSION SNAPSHOT", 14, overlayY + 8, leftMaxWidth);
+
+    ctx.font = "14px 'JetBrains Mono', monospace";
+    ctx.fillStyle = "#ffd700";
+    ctx.fillText(
+      `P1 ${padNum(score1Frame, 5)} | ICE ${padNum(p1Frame?.iceDeposited, 4)}kg | VIO ${padNum(p1Frame?.safetyViolations, 2)} | ${infrastructureInline(p1Frame)}`,
+      14,
+      overlayY + 28,
+      leftMaxWidth,
+    );
+    ctx.fillStyle = "#d274ff";
+    ctx.fillText(
+      `P2 ${padNum(score2Frame, 5)} | ICE ${padNum(p2Frame?.iceDeposited, 4)}kg | VIO ${padNum(p2Frame?.safetyViolations, 2)} | ${infrastructureInline(p2Frame)}`,
+      14,
+      overlayY + 48,
+      leftMaxWidth,
+    );
+
+    ctx.textAlign = "right";
+    ctx.fillStyle = "#7fd9ff";
+    ctx.fillText(`EXTRACTED ${padNum(totalExtracted, 5)} / ${padNum(totalMapIce, 5)} kg`, W - 14, overlayY + 8);
+    ctx.fillText(`MAP DEPLETION ${String(extractionPct.toFixed(1)).padStart(5, " ")}%`, W - 14, overlayY + 28);
+    ctx.fillText(gridStatusLabel(frame.powerGridState), W - 14, overlayY + 48);
+
+    ctx.textAlign = "right";
+    ctx.textBaseline = "bottom";
+    ctx.font = "13px 'JetBrains Mono', monospace";
+    ctx.fillStyle = "rgba(230,245,255,0.92)";
+    const stamp = `R${frame.round} • D${frame.day + 1}/${DAYS_PER_ROUND} • DAY ${frame.globalDay + 1}`;
+    const stampW = ctx.measureText(stamp).width;
+    const boxW = stampW + 16;
+    const boxH = 24;
+    const boxX = W - boxW - 12;
+    const boxY = H - boxH - 10;
+    ctx.fillStyle = "rgba(2,8,18,0.78)";
+    ctx.fillRect(boxX, boxY, boxW, boxH);
+    ctx.strokeStyle = "rgba(120,180,255,0.24)";
+    ctx.strokeRect(boxX + 0.5, boxY + 0.5, boxW - 1, boxH - 1);
+    ctx.fillStyle = "rgba(230,245,255,0.92)";
+    ctx.fillText(stamp, W - 20, H - 16);
+
+    if (p2ArrivalDays != null) {
+      const arrivalText = `P2 ARRIVES IN ${p2ArrivalDays} DAY${p2ArrivalDays === 1 ? "" : "S"}`;
+      ctx.textAlign = "left";
+      ctx.textBaseline = "bottom";
+      ctx.font = "13px 'JetBrains Mono', monospace";
+      const arrivalW = ctx.measureText(arrivalText).width;
+      const arrivalBoxW = arrivalW + 16;
+      const arrivalBoxH = 24;
+      const arrivalBoxX = 12;
+      const arrivalBoxY = H - arrivalBoxH - 10;
+      ctx.fillStyle = "rgba(2,8,18,0.78)";
+      ctx.fillRect(arrivalBoxX, arrivalBoxY, arrivalBoxW, arrivalBoxH);
+      ctx.strokeStyle = "rgba(120,180,255,0.24)";
+      ctx.strokeRect(arrivalBoxX + 0.5, arrivalBoxY + 0.5, arrivalBoxW - 1, arrivalBoxH - 1);
+      ctx.fillStyle = "#7fd9ff";
+      ctx.fillText(arrivalText, arrivalBoxX + 8, H - 16);
+    }
+
+    return composed;
+  };
+
+  async function exportMissionGif() {
+    if (gifExporting || !canvasRef.current || !p1) return;
+    setGifExporting(true);
+    const savedSnapshot = captureUndoSnapshot();
+    const savedReplayRun = replayRun;
+    const savedReplayFrameIndex = replayFrameIndex;
+    const savedReplayPlaying = replayPlaying;
+    try {
+      setReplayPlaying(false);
+      const sourceFrames = replayRun?.frames?.length
+        ? replayRun.frames
+        : liveTimeline.map(({ __key, ...frame }) => frame);
+      const logSource = replayRun?.missionLog?.length ? replayRun.missionLog : missionLog;
+      const framesToExport = sourceFrames.length ? sourceFrames : [snapshotLiveFrame()];
+      const gif = new GIF({
+        workers: 2,
+        quality: 10,
+        width: W,
+        height: H + GIF_OVERLAY_HEIGHT,
+        workerScript: gifWorkerUrl,
+      });
+
+      for (const frame of framesToExport) {
+        applyFrameSnapshot(frame, logSource);
+        await waitForPaint(2);
+        gif.addFrame(composeGifFrame(frame), { copy: true, delay: GIF_FRAME_DELAY });
+      }
+
+      const blob = await new Promise((resolve, reject) => {
+        gif.on("finished", resolve);
+        gif.on("abort", () => reject(new Error("GIF export aborted")));
+        gif.render();
+      });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `psr_mission_${replayRun ? "replay" : "live"}_day${globalDay + 1}.gif`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } finally {
+      if (savedReplayRun?.frames?.[savedReplayFrameIndex]) {
+        setReplayRun(savedReplayRun);
+        setReplayFrameIndex(savedReplayFrameIndex);
+        applyFrameSnapshot(savedReplayRun.frames[savedReplayFrameIndex], savedReplayRun.missionLog || []);
+        setReplayPlaying(savedReplayPlaying);
+      } else {
+        setReplayRun(null);
+        setReplayFrameIndex(0);
+        setReplayPlaying(false);
+        applyUndoSnapshot(savedSnapshot);
+      }
+      setGifExporting(false);
+    }
+  }
+
+  const plotSource = useMemo(() => {
+    const frames = replayRun?.frames?.length
+      ? replayRun.frames
+      : liveTimeline.length
+        ? liveTimeline.map(({ __key, ...frame }) => frame)
+        : (p1 ? [snapshotLiveFrame()] : []);
+    const log = replayRun?.missionLog?.length ? replayRun.missionLog : missionLog;
+    return { frames, log };
+  }, [
+    replayRun, liveTimeline, missionLog, p1, p2, round, day, globalDay,
+    claimR, history, powerGridState, craterHealth, phase
+  ]);
+
+  const plotDefinitions = useMemo(() => {
+    const frames = plotSource.frames || [];
+    const log = plotSource.log || [];
+    if (!frames.length) return [];
+
+    const xLabels = frames.map(f => `D${(f.globalDay ?? 0) + 1}`);
+    const PLAYER_PALETTES = {
+      1: {
+        solar: ["#00c2d1", "#34d8eb", "#00a7b5", "#6fe7f2", "#00e5ff", "#4dd0e1"],
+        reactor: ["#1fb8a5", "#39c9b8", "#0f9484", "#74dfd2", "#26a69a", "#80cbc4"],
+        habitat: ["#4aa3ff", "#6db6ff", "#2f87e6", "#8fc8ff", "#2979ff", "#82b1ff"],
+        rover: ["#008fd5", "#29a6ea", "#0076b3", "#63bff2", "#00b0ff", "#40c4ff"],
+        score: ["#00b8d9"],
+        violation: ["#008fd5"],
+      },
+      2: {
+        solar: ["#ff6b6b", "#ff8b7a", "#e85a5a", "#ffb0a3", "#ff5252", "#ef9a9a"],
+        reactor: ["#ff8c42", "#ff9f5c", "#e67324", "#ffc08a", "#ff7043", "#ffab91"],
+        habitat: ["#ff7f50", "#ff9666", "#e76b3c", "#ffb28f", "#ff6e40", "#ffab91"],
+        rover: ["#f25f5c", "#ff7a73", "#d94d4a", "#ffaaa6", "#ff5252", "#ff8a80"],
+        score: ["#ff6b6b"],
+        violation: ["#ff8c42"],
+      },
+    };
+    const hexToRgba = (hex, alpha = 1) => {
+      const h = hex.replace("#", "");
+      const bigint = parseInt(h.length === 3 ? h.split("").map(ch => ch + ch).join("") : h, 16);
+      const r = (bigint >> 16) & 255;
+      const g = (bigint >> 8) & 255;
+      const b = bigint & 255;
+      return `rgba(${r},${g},${b},${alpha})`;
+    };
+    const seriesColor = (playerId, type = "score", assetIdx = 1, alpha = 1) => {
+      const paletteSet = PLAYER_PALETTES[playerId] || {};
+      const palette = paletteSet[type] || ["#7fd9ff"];
+      const hex = palette[(Math.max(1, assetIdx) - 1) % palette.length];
+      return hexToRgba(hex, alpha);
+    };
+    const consumerPowerSeriesMap = new Map();
+    const generatorPowerSeriesMap = new Map();
+
+    const ensureSeries = (map, key, meta, frameCount) => {
+      if (!map.has(key)) map.set(key, { key, data: new Array(frameCount).fill(null), ...meta });
+      return map.get(key);
+    };
+
+    frames.forEach((frame, frameIdx) => {
+      [frame.p1, frame.p2].forEach((player, pi) => {
+        if (!player) return;
+        const playerId = pi + 1;
+        (player.panels || []).forEach((panel, idx) => {
+          const key = `P${playerId}-solar-${idx+1}`;
+          const series = ensureSeries(generatorPowerSeriesMap, key, {
+            label: `P${playerId} Solar ${idx+1}`,
+            color: seriesColor(playerId, "solar", idx + 1, 0.95),
+            playerId,
+            assetIdx: idx + 1,
+          }, frames.length);
+          series.data[frameIdx] = player.generatorSupplyTotals?.[`solar-${idx}`] ?? 0;
+        });
+        (player.reactors || []).forEach((reactor, idx) => {
+          const key = `P${playerId}-reactor-${idx+1}`;
+          const series = ensureSeries(generatorPowerSeriesMap, key, {
+            label: `P${playerId} Reactor ${idx+1}`,
+            color: seriesColor(playerId, "reactor", idx + 1, 0.95),
+            playerId,
+            assetIdx: idx + 1,
+          }, frames.length);
+          series.data[frameIdx] = player.generatorSupplyTotals?.[`reactor-${idx}`] ?? 0;
+        });
+        (player.habitats || []).forEach((habitat, idx) => {
+          const key = `P${playerId}-habitat-${idx+1}`;
+          const series = ensureSeries(consumerPowerSeriesMap, key, {
+            label: `P${playerId} Habitat ${idx+1}`,
+            color: seriesColor(playerId, "habitat", idx + 1, 0.9),
+            playerId,
+            assetIdx: idx + 1,
+          }, frames.length);
+          series.data[frameIdx] = player.habitatPower?.[idx] ?? 0;
+        });
+        const roverEntries = [player, ...((player.extraRovers || []))];
+        roverEntries.forEach((rover, idx) => {
+          const key = `P${playerId}-rover-${idx+1}`;
+          const series = ensureSeries(consumerPowerSeriesMap, key, {
+            label: `P${playerId} Rover ${idx+1}`,
+            color: seriesColor(playerId, "rover", idx + 1, 1),
+            playerId,
+            assetIdx: idx + 1,
+          }, frames.length);
+          series.data[frameIdx] = rover?.power ?? null;
+        });
+      });
+    });
+
+    const consumerPowerSeries = [...consumerPowerSeriesMap.values()].sort((a, b) =>
+      a.playerId - b.playerId || a.assetIdx - b.assetIdx
+    );
+    const generatorPowerSeries = [...generatorPowerSeriesMap.values()].sort((a, b) =>
+      a.playerId - b.playerId || a.assetIdx - b.assetIdx
+    );
+
+    const roverIceMap = new Map();
+    const roverIceTotals = {};
+    const ensureRoverIceSeries = (playerId, roverId) => {
+      const key = `P${playerId}-rover-${roverId}`;
+      if (!roverIceMap.has(key)) {
+        roverIceMap.set(key, {
+          key,
+          label: `P${playerId} Rover ${roverId}`,
+          color: seriesColor(playerId, "rover", roverId, 1),
+          playerId,
+          assetIdx: roverId,
+          data: new Array(frames.length).fill(null),
+        });
+      }
+      return key;
+    };
+    let logCursor = 0;
+    frames.forEach((frame, frameIdx) => {
+      [frame.p1, frame.p2].forEach((player, pi) => {
+        if (!player) return;
+        const playerId = pi + 1;
+        const roverCount = 1 + ((player.extraRovers || []).length);
+        for (let roverId = 1; roverId <= roverCount; roverId++) {
+          const key = ensureRoverIceSeries(playerId, roverId);
+          if (roverIceTotals[key] == null) roverIceTotals[key] = 0;
+          roverIceMap.get(key).data[frameIdx] = roverIceTotals[key];
+        }
+      });
+      while (logCursor < log.length && logCursor < (frame.logLength || 0)) {
+        const ev = log[logCursor];
+        if (ev?.type === "deposit" && ev.actor && ev.roverId) {
+          const key = ensureRoverIceSeries(ev.actor, ev.roverId);
+          roverIceTotals[key] = (roverIceTotals[key] || 0) + (ev.kg || 0);
+          roverIceMap.get(key).data[frameIdx] = roverIceTotals[key];
+        }
+        logCursor += 1;
+      }
+    });
+    const roverIceSeries = [...roverIceMap.values()].sort((a, b) =>
+      a.playerId - b.playerId || a.assetIdx - b.assetIdx
+    );
+
+    const roverDeliveredMap = new Map();
+    const roverDeliveredTotals = {};
+    const ensureRoverDeliveredSeries = (playerId, roverId) => {
+      const key = `P${playerId}-delivered-rover-${roverId}`;
+      if (!roverDeliveredMap.has(key)) {
+        roverDeliveredMap.set(key, {
+          key,
+          label: `P${playerId} Rover ${roverId}`,
+          color: seriesColor(playerId, "rover", roverId, 1),
+          playerId,
+          assetIdx: roverId,
+          data: new Array(frames.length).fill(null),
+        });
+      }
+      return key;
+    };
+    let deliveredLogCursor = 0;
+    frames.forEach((frame, frameIdx) => {
+      [frame.p1, frame.p2].forEach((player, pi) => {
+        if (!player) return;
+        const playerId = pi + 1;
+        const roverCount = 1 + ((player.extraRovers || []).length);
+        for (let roverId = 1; roverId <= roverCount; roverId++) {
+          const key = ensureRoverDeliveredSeries(playerId, roverId);
+          if (roverDeliveredTotals[key] == null) roverDeliveredTotals[key] = 0;
+          roverDeliveredMap.get(key).data[frameIdx] = roverDeliveredTotals[key];
+        }
+      });
+      while (deliveredLogCursor < log.length && deliveredLogCursor < (frame.logLength || 0)) {
+        const ev = log[deliveredLogCursor];
+        if (ev?.type === "deposit" && ev.actor && ev.roverId) {
+          const key = ensureRoverDeliveredSeries(ev.actor, ev.roverId);
+          roverDeliveredTotals[key] = (roverDeliveredTotals[key] || 0) + (ev.kg || 0);
+          roverDeliveredMap.get(key).data[frameIdx] = roverDeliveredTotals[key];
+        }
+        deliveredLogCursor += 1;
+      }
+    });
+    const roverDeliveredSeries = [...roverDeliveredMap.values()].sort((a, b) =>
+      a.playerId - b.playerId || a.assetIdx - b.assetIdx
+    );
+
+    const roverMoveMap = new Map();
+    const ensureRoverMoveSeries = (playerId, roverId) => {
+      const key = `P${playerId}-move-rover-${roverId}`;
+      if (!roverMoveMap.has(key)) {
+        roverMoveMap.set(key, {
+          key,
+          label: `P${playerId} Rover ${roverId}`,
+          color: seriesColor(playerId, "rover", roverId, 1),
+          playerId,
+          assetIdx: roverId,
+          data: new Array(frames.length).fill(null),
+        });
+      }
+      return roverMoveMap.get(key);
+    };
+    const roverMoveTotals = {};
+    frames.forEach((frame, frameIdx) => {
+      [frame.p1, frame.p2].forEach((player, pi) => {
+        if (!player) return;
+        const playerId = pi + 1;
+        const rovers = [player, ...((player.extraRovers || []))];
+        rovers.forEach((rover, idx) => {
+          const roverId = idx + 1;
+          const key = `P${playerId}-move-rover-${roverId}`;
+          const series = ensureRoverMoveSeries(playerId, roverId);
+          if (roverMoveTotals[key] == null) roverMoveTotals[key] = 0;
+          if (frameIdx > 0) {
+            const prevPlayer = playerId === 1 ? frames[frameIdx - 1]?.p1 : frames[frameIdx - 1]?.p2;
+            const prevRover = idx === 0 ? prevPlayer : (prevPlayer?.extraRovers || [])[idx - 1];
+            if (prevRover && rover) {
+              roverMoveTotals[key] += d2({ x: prevRover.x, y: prevRover.y }, { x: rover.x, y: rover.y }) / PIXELS_PER_KM;
+            }
+          }
+          series.data[frameIdx] = roverMoveTotals[key];
+        });
+      });
+    });
+    const roverMoveSeries = [...roverMoveMap.values()].sort((a, b) =>
+      a.playerId - b.playerId || a.assetIdx - b.assetIdx
+    );
+
+    const STATUS_ORDER = ["idle_nopsr", "idle", "moving", "mining", "carrying", "depositing", "depleted"];
+    const statusToValue = Object.fromEntries(STATUS_ORDER.map((s, i) => [s, i]));
+    const roverStateMap = new Map();
+    const ensureRoverStateSeries = (playerId, roverId) => {
+      const key = `P${playerId}-state-rover-${roverId}`;
+      if (!roverStateMap.has(key)) {
+        roverStateMap.set(key, {
+          key,
+          label: `P${playerId} Rover ${roverId}`,
+          color: seriesColor(playerId, "rover", roverId, 1),
+          playerId,
+          assetIdx: roverId,
+          data: new Array(frames.length).fill(null),
+        });
+      }
+      return roverStateMap.get(key);
+    };
+    frames.forEach((frame, frameIdx) => {
+      [frame.p1, frame.p2].forEach((player, pi) => {
+        if (!player) return;
+        const playerId = pi + 1;
+        const rovers = [player, ...((player.extraRovers || []))];
+        rovers.forEach((rover, idx) => {
+          const series = ensureRoverStateSeries(playerId, idx + 1);
+          const status = rover?.status || "idle";
+          series.data[frameIdx] = statusToValue[status] ?? statusToValue.idle;
+        });
+      });
+    });
+    const roverStateSeries = [...roverStateMap.values()].sort((a, b) =>
+      a.playerId - b.playerId || a.assetIdx - b.assetIdx
+    );
+
+    const scoreSeries = [
+      { key:"score-p1", label:"P1 Score", color:seriesColor(1, "score", 1, 1), data:frames.map(f => scorePlayerState(f.p1)) },
+      { key:"score-p2", label:"P2 Score", color:seriesColor(2, "score", 1, 1), data:frames.map(f => scorePlayerState(f.p2)) },
+    ];
+    const budgetSeries = [
+      { key:"budget-p1", label:"P1 Budget", color:seriesColor(1, "score", 1, 1), data:frames.map(f => f.p1?.budget ?? 0) },
+      { key:"budget-p2", label:"P2 Budget", color:seriesColor(2, "score", 1, 1), data:frames.map(f => f.p2?.budget ?? 0) },
+    ];
+    const violationSeries = [
+      { key:"vio-p1", label:"P1 Violations", color:seriesColor(1, "violation", 1, 1), data:frames.map(f => f.p1?.safetyViolations ?? 0) },
+      { key:"vio-p2", label:"P2 Violations", color:seriesColor(2, "violation", 1, 1), data:frames.map(f => f.p2?.safetyViolations ?? 0) },
+    ];
+    const sharedSeries = [
+      { key:"shared", label:"Shared Grid", color:"#7fd9ff", data:frames.map(f => f.powerGridState?.mode === "shared" ? 1 : 0) },
+    ];
+    const p1SupplyAllocationSeries = [
+      { key:"p1-to-p1", label:"P1 Generators → P1 Assets", color:seriesColor(1, "solar", 1, 1), data:frames.map(f => f.p1?.generatorSupplyByRecipient?.[1] ?? 0) },
+      { key:"p1-to-p2", label:"P1 Generators → P2 Assets", color:"#7fd9ff", data:frames.map(f => f.p1?.generatorSupplyByRecipient?.[2] ?? 0) },
+    ];
+    const p2SupplyAllocationSeries = [
+      { key:"p2-to-p1", label:"P2 Generators → P1 Assets", color:"#7fd9ff", data:frames.map(f => f.p2?.generatorSupplyByRecipient?.[1] ?? 0) },
+      { key:"p2-to-p2", label:"P2 Generators → P2 Assets", color:seriesColor(2, "solar", 1, 1), data:frames.map(f => f.p2?.generatorSupplyByRecipient?.[2] ?? 0) },
+    ];
+    const structureHealthMap = new Map();
+    const ensureHealthSeries = (playerId, type, assetIdx) => {
+      const key = `P${playerId}-${type}-health-${assetIdx}`;
+      const healthTypeMeta = {
+        panels: { label: "Solar Panel", colorType: "solar" },
+        reactors: { label: "Nuclear Reactor", colorType: "reactor" },
+        habitats: { label: "Habitat", colorType: "habitat" },
+        extraRovers: { label: "Rover", colorType: "rover" },
+        landingPads: { label: "Landing Pad", colorType: "reactor" },
+      };
+      const meta = healthTypeMeta[type] || { label: type, colorType: "solar" };
+      if (!structureHealthMap.has(key)) {
+        structureHealthMap.set(key, {
+          key,
+          label: `P${playerId} ${meta.label} ${assetIdx}`,
+          color: seriesColor(playerId, meta.colorType, assetIdx, 1),
+          playerId,
+          assetIdx,
+          data: new Array(frames.length).fill(null),
+        });
+      }
+      return structureHealthMap.get(key);
+    };
+    frames.forEach((frame, frameIdx) => {
+      [frame.p1, frame.p2].forEach((player, pi) => {
+        if (!player) return;
+        const playerId = pi + 1;
+        const groups = [
+          ["panels", player.panels || [], player.structureHealth?.panels || []],
+          ["reactors", player.reactors || [], player.structureHealth?.reactors || []],
+          ["habitats", player.habitats || [], player.structureHealth?.habitats || []],
+          ["extraRovers", player.extraRovers || [], player.structureHealth?.extraRovers || []],
+          ["landingPads", player.landingPads || [], player.structureHealth?.landingPads || []],
+        ];
+        groups.forEach(([type, list, healths]) => {
+          list.forEach((_, idx) => {
+            const series = ensureHealthSeries(playerId, type, idx + 1);
+            series.data[frameIdx] = (healths[idx] ?? 1) * 100;
+          });
+        });
+      });
+    });
+    const structureHealthSeries = [...structureHealthMap.values()].sort((a, b) =>
+      a.playerId - b.playerId || a.label.localeCompare(b.label)
+    );
+
+    const purchaseSeriesMap = new Map();
+    const purchaseLabels = ["Solar Panel", "Nuclear Reactor", "Habitat", "Rover"];
+    const resupplyLabels = ["No Resupply", "Resupply"];
+    let purchaseCursor = 0;
+    const addPointSeries = (map, prefix, ev, idx, colorType, customLabel) => {
+      const key = `${prefix}-${idx}`;
+      const label = customLabel || ev.label || `P${ev.actor} ${structureLabel(ev.itemType)} ${idx + 1}`;
+      map.set(key, {
+        key,
+        label,
+        color: seriesColor(ev.actor || 1, colorType, idx + 1, 1),
+        playerId: ev.actor || 1,
+        assetIdx: idx + 1,
+        data: new Array(frames.length).fill(null),
+        pointOnly: true,
+      });
+      return map.get(key);
+    };
+    frames.forEach((frame, frameIdx) => {
+      while (purchaseCursor < log.length && purchaseCursor < (frame.logLength || 0)) {
+        const ev = log[purchaseCursor];
+        if (ev?.type === "purchase" && ev.itemType) {
+          if (ev.itemType === "resupply") {
+            // handled below as a single baseline-plus-spike series
+          } else {
+            const typeKey = ev.itemType === "solar" ? "solar" : ev.itemType === "reactor" ? "reactor" : ev.itemType === "habitat" ? "habitat" : "rover";
+            const series = addPointSeries(
+              purchaseSeriesMap,
+              "purchase",
+              ev,
+              purchaseSeriesMap.size,
+              typeKey,
+              `P${ev.actor} ${structureLabel(ev.itemType)}`
+            );
+            const yValue = { solar:0, reactor:1, habitat:2, rover:3 }[ev.itemType] ?? 0;
+            series.data[frameIdx] = yValue;
+          }
+        }
+        purchaseCursor += 1;
+      }
+    });
+    const purchaseSeries = [...purchaseSeriesMap.values()];
+    const resupplyData = new Array(frames.length).fill(0);
+    let resupplyLogCursor = 0;
+    frames.forEach((frame, frameIdx) => {
+      while (resupplyLogCursor < log.length && resupplyLogCursor < (frame.logLength || 0)) {
+        const ev = log[resupplyLogCursor];
+        if (ev?.type === "purchase" && ev.itemType === "resupply") {
+          resupplyData[frameIdx] = 1;
+        }
+        resupplyLogCursor += 1;
+      }
+    });
+    const resupplySeries = [{
+      key: "resupply-timeline",
+      label: "Resupply Purchases",
+      color: "#7fd9ff",
+      playerId: 0,
+      assetIdx: 1,
+      data: resupplyData,
+      spikeOnly: true,
+    }];
+
+    const makePlot = (id, title, series, opts = {}) => {
+      const legendCols = opts.legendCols || 3;
+      const legendRows = Math.max(1, Math.ceil(Math.max(1, series.length) / legendCols));
+      return {
+        id,
+        title,
+        series,
+        xLabels,
+        yLabel: opts.yLabel || "",
+        xLabel: opts.xLabel || "Days",
+        booleanPlot: !!opts.booleanPlot,
+        categoricalTicks: opts.categoricalTicks || null,
+        pointOnly: !!opts.pointOnly,
+        tickFormatter: opts.tickFormatter || null,
+        legendCols,
+        width: 980,
+        height: 270 + legendRows * 18,
+      };
+    };
+
+    return [
+      makePlot("power-state-over-time", "Power State Over Time", consumerPowerSeries, { yLabel:"Power units", legendCols: 4 }),
+      makePlot("power-supplied-over-time", "Cumulative Power Supplied Over Time", generatorPowerSeries, { yLabel:"Power units", legendCols: 4 }),
+      makePlot("p1-power-supply-allocation", "Cumulative P1 Power Supply Over Time", p1SupplyAllocationSeries, { yLabel:"Power units", legendCols: 2 }),
+      makePlot("p2-power-supply-allocation", "Cumulative P2 Power Supply Over Time", p2SupplyAllocationSeries, { yLabel:"Power units", legendCols: 2 }),
+      makePlot("ice-by-rover", "Cumulative Ice Extracted Over Time By Rover", roverIceSeries, { yLabel:"kg", legendCols: 4 }),
+      makePlot("ice-delivered-by-rover", "Cumulative Ice Delivered Over Time By Rover", roverDeliveredSeries, { yLabel:"kg", legendCols: 4 }),
+      makePlot("movement-by-rover", "Cumulative Movement By Rover", roverMoveSeries, { yLabel:"km", legendCols: 4 }),
+      makePlot("rover-state-over-time", "Rover State Over Time", roverStateSeries, { legendCols: 4, categoricalTicks: STATUS_ORDER.map(key => STATUS_INFO[key]?.label || key) }),
+      makePlot("asset-purchases", "Asset Purchases", purchaseSeries, { legendCols: 3, categoricalTicks: purchaseLabels, pointOnly: true }),
+      makePlot("resupply-purchases", "Resupply Purchases", resupplySeries, { legendCols: 2, categoricalTicks: resupplyLabels }),
+      makePlot("structure-health-over-time", "Structure Health Over Time", structureHealthSeries, { yLabel:"Health %", legendCols: 4, tickFormatter:(v)=>`${Math.round(v)}%` }),
+      makePlot("budget-over-time", "Budget Over Time", budgetSeries, { yLabel:"credits", legendCols: 2, tickFormatter:(v)=>`${Math.round(v)}cr` }),
+      makePlot("score-over-time", "Score Over Time", scoreSeries, { legendCols: 2 }),
+      makePlot("violations-over-time", "Safety Zone Violations Over Time", violationSeries, { legendCols: 2 }),
+      makePlot("shared-status", "Shared Grid Status Over Time", sharedSeries, { booleanPlot: true, legendCols: 1 }),
+    ];
+  }, [plotSource, physOverrides]);
+
+  const drawPlotCanvas = (canvas, plot) => {
+    if (!canvas || !plot) return;
+    const ctx = canvas.getContext("2d");
+    const width = plot.width;
+    const height = plot.height;
+    canvas.width = width;
+    canvas.height = height;
+    ctx.clearRect(0, 0, width, height);
+    ctx.fillStyle = "#020914";
+    ctx.fillRect(0, 0, width, height);
+
+    const yTickLabels = plot.booleanPlot
+      ? ["TRUE", "FALSE"]
+      : (plot.categoricalTicks || []);
+    const longestYTick = yTickLabels.reduce((max, label) => Math.max(max, String(label || "").length), 0);
+    const leftMargin = plot.categoricalTicks
+      ? Math.min(240, Math.max(92, 28 + longestYTick * 8))
+      : 56;
+    const margin = { top: 42, right: 18, bottom: 78 + Math.ceil(Math.max(1, plot.series.length) / plot.legendCols) * 18, left: leftMargin + (plot.yLabel ? 18 : 0) };
+    const chartW = width - margin.left - margin.right;
+    const chartH = height - margin.top - margin.bottom;
+    const flatValues = plot.series.flatMap(s => s.data.filter(v => v != null));
+    const yMin = 0;
+    const yMax = plot.booleanPlot ? 1 : plot.categoricalTicks ? Math.max(1, plot.categoricalTicks.length - 1) : Math.max(1, ...flatValues, 0);
+
+    ctx.fillStyle = "#5f86a0";
+    ctx.font = "16px 'Orbitron', monospace";
+    ctx.textBaseline = "top";
+    ctx.fillText(plot.title, 14, 10);
+
+    ctx.strokeStyle = "rgba(255,255,255,0.08)";
+    ctx.lineWidth = 1;
+    const gridSteps = plot.booleanPlot ? 1 : plot.categoricalTicks ? Math.max(1, plot.categoricalTicks.length - 1) : 4;
+    for (let i = 0; i <= gridSteps; i++) {
+      const y = margin.top + (chartH * i / Math.max(1, gridSteps));
+      ctx.beginPath();
+      ctx.moveTo(margin.left, y);
+      ctx.lineTo(width - margin.right, y);
+      ctx.stroke();
+      const value = yMax - ((yMax - yMin) * i / Math.max(1, gridSteps));
+      ctx.fillStyle = "#537189";
+      ctx.font = "11px 'JetBrains Mono', monospace";
+      ctx.textAlign = "right";
+      const tickLabel = plot.booleanPlot
+        ? (value >= 0.5 ? "TRUE" : "FALSE")
+        : plot.categoricalTicks
+          ? (plot.categoricalTicks[Math.round(value)] ?? "")
+          : plot.tickFormatter
+            ? plot.tickFormatter(value)
+            : value.toFixed(value >= 10 ? 0 : 1);
+      ctx.fillText(tickLabel, margin.left - 8, y - 6);
+    }
+
+    const pointX = (idx) => margin.left + (plot.xLabels.length <= 1 ? 0 : (chartW * idx / (plot.xLabels.length - 1)));
+    const pointY = (value) => margin.top + chartH - (((value - yMin) / Math.max(1e-6, yMax - yMin)) * chartH);
+    const xTickCount = Math.min(6, plot.xLabels.length);
+    ctx.textAlign = "center";
+    for (let i = 0; i < xTickCount; i++) {
+      const idx = plot.xLabels.length <= 1 ? 0 : Math.round((plot.xLabels.length - 1) * i / Math.max(1, xTickCount - 1));
+      const x = pointX(idx);
+      ctx.strokeStyle = "rgba(255,255,255,0.06)";
+      ctx.beginPath();
+      ctx.moveTo(x, margin.top);
+      ctx.lineTo(x, margin.top + chartH);
+      ctx.stroke();
+      ctx.fillStyle = "#537189";
+      ctx.font = "11px 'JetBrains Mono', monospace";
+      ctx.fillText(plot.xLabels[idx], x, margin.top + chartH + 10);
+    }
+
+    if (plot.xLabel) {
+      ctx.textAlign = "center";
+      ctx.fillStyle = "#6c90a8";
+      ctx.font = "12px 'JetBrains Mono', monospace";
+      ctx.fillText(plot.xLabel, margin.left + chartW / 2, margin.top + chartH + 28);
+    }
+
+    if (plot.yLabel) {
+      ctx.save();
+      ctx.translate(18, margin.top + chartH / 2);
+      ctx.rotate(-Math.PI / 2);
+      ctx.textAlign = "center";
+      ctx.fillStyle = "#6c90a8";
+      ctx.font = "12px 'JetBrains Mono', monospace";
+      ctx.fillText(plot.yLabel, 0, 0);
+      ctx.restore();
+    }
+
+    plot.series.forEach((series) => {
+      let firstIdx = series.data.findIndex(v => v != null);
+      if (firstIdx < 0) return;
+      if (!plot.pointOnly && !series.pointOnly) {
+        ctx.strokeStyle = series.color;
+        ctx.lineWidth = plot.booleanPlot ? 2 : 2.2;
+        ctx.beginPath();
+        let started = false;
+        series.data.forEach((value, idx) => {
+          if (value == null) { started = false; return; }
+          const x = pointX(idx);
+          const y = pointY(value);
+          if (!started) { ctx.moveTo(x, y); started = true; }
+          else { ctx.lineTo(x, y); }
+        });
+        ctx.stroke();
+        const firstValue = series.data[firstIdx];
+        const bubbleX = pointX(firstIdx);
+        const bubbleY = pointY(firstValue);
+        ctx.fillStyle = "#020914";
+        ctx.beginPath();
+        ctx.arc(bubbleX, bubbleY, 4, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = series.color;
+        ctx.lineWidth = 2;
+        ctx.stroke();
+        if (series.spikeOnly) {
+          series.data.forEach((value, idx) => {
+            if (value == null || value <= 0) return;
+            const bubbleX = pointX(idx);
+            const bubbleY = pointY(value);
+            ctx.fillStyle = "#020914";
+            ctx.beginPath();
+            ctx.arc(bubbleX, bubbleY, 4, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.strokeStyle = series.color;
+            ctx.lineWidth = 2;
+            ctx.stroke();
+          });
+        }
+      } else {
+        series.data.forEach((value, idx) => {
+          if (value == null) return;
+          const bubbleX = pointX(idx);
+          const bubbleY = pointY(value);
+          ctx.fillStyle = "#020914";
+          ctx.beginPath();
+          ctx.arc(bubbleX, bubbleY, 4, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.strokeStyle = series.color;
+          ctx.lineWidth = 2;
+          ctx.stroke();
+        });
+      }
+    });
+
+    const legendStartY = margin.top + chartH + 44;
+    const colWidth = Math.floor((width - 24) / plot.legendCols);
+    plot.series.forEach((series, idx) => {
+      const col = idx % plot.legendCols;
+      const row = Math.floor(idx / plot.legendCols);
+      const x = 14 + col * colWidth;
+      const y = legendStartY + row * 18;
+      ctx.fillStyle = series.color;
+      ctx.fillRect(x, y + 4, 12, 4);
+      ctx.fillStyle = "#9ab7cc";
+      ctx.textAlign = "left";
+      ctx.font = "11px 'JetBrains Mono', monospace";
+      ctx.fillText(series.label, x + 18, y);
+    });
+  };
+
+  const downloadCanvasPng = (canvas, filename) => {
+    if (!canvas) return;
+    const a = document.createElement("a");
+    a.href = canvas.toDataURL("image/png");
+    a.download = filename;
+    a.click();
+  };
+
+  const exportAllPlots = () => {
+    plotDefinitions.forEach(plot => {
+      const canvas = plotCanvasRefs.current[plot.id];
+      if (canvas) downloadCanvasPng(canvas, `${plot.id}.png`);
+    });
+  };
+
+  const buildSeparatePlot = (plot, series, idx) => ({
+    ...plot,
+    id: `${plot.id}-single-${idx}`,
+    title: `${plot.title} — ${series.label}`,
+    series: [{ ...series }],
+    legendCols: 1,
+    height: 240 + 18,
+  });
+
+  const PlotCanvas = ({ plot }) => {
+    const ref = useRef(null);
+    useEffect(() => {
+      if (ref.current) {
+        drawPlotCanvas(ref.current, plot);
+        plotCanvasRefs.current[plot.id] = ref.current;
+      }
+    }, [plot]);
+    return (
+      <canvas
+        ref={ref}
+        width={plot.width}
+        height={plot.height}
+        style={{ width:"100%", height:"auto", display:"block", borderRadius:8, background:"#020914" }}
+      />
+    );
+  };
+
   const Bar = ({ val, max, color, h=4 }) => {
     const pct = clamp((val/max)*100,0,100);
     return (
@@ -3388,11 +4262,11 @@ export default function App() {
   // capping either player. Tune these to taste.
   const PTS_PER_KG  = 1;    // 1 point per kg of ice deposited
   const PTS_PER_AP  = 15;   // 15 points per asset point built
-  const PTS_PER_DIP = 3;    // 3 points per diplomacy point
   const ap1 = p1?.assetPts ?? 0, ap2 = p2?.assetPts ?? 0;
-  const dip1 = p1?.diplomacy ?? 0, dip2 = p2?.diplomacy ?? 0;
-  const score1 = totalIce1 * PTS_PER_KG + ap1 * PTS_PER_AP + dip1 * PTS_PER_DIP;
-  const score2 = totalIce2 * PTS_PER_KG + ap2 * PTS_PER_AP + dip2 * PTS_PER_DIP;
+  const adj1 = p1?.scoreAdjustments ?? 0, adj2 = p2?.scoreAdjustments ?? 0;
+  const vio1 = p1?.safetyViolations ?? 0, vio2 = p2?.safetyViolations ?? 0;
+  const score1 = totalIce1 * PTS_PER_KG + ap1 * PTS_PER_AP + adj1 - vio1 * 25;
+  const score2 = totalIce2 * PTS_PER_KG + ap2 * PTS_PER_AP + adj2 - vio2 * 25;
   const winner = phase===PHASE.DONE ? (score1>score2?1:score2>score1?2:0) : null;
   const share1 = score1 / (score1+score2||1);
   const replayActive = !!replayRun;
@@ -3553,7 +4427,7 @@ export default function App() {
 
         <div style={{ marginBottom:20 }}>
           <div style={{ fontSize:7, letterSpacing:"0.25em", color:"#2a4050", marginBottom:8,
-            fontFamily:"'Orbitron',monospace" }}>GRID DIPLOMACY</div>
+            fontFamily:"'Orbitron',monospace" }}>GRID SHARING</div>
           <div style={{ display:"flex", gap:6, marginBottom:8 }}>
             {[
               ["enabled", "SHARING ENABLED", "Offers and joins may occur"],
@@ -3642,7 +4516,7 @@ export default function App() {
             <>
               <div>1. Launch a seeded batch of bot-vs-bot missions under the current ruleset.</div>
               <div>2. Watch the circular progress indicator fill as runs complete in the background.</div>
-              <div>3. Review win rates, ice output, diplomacy, and shared-grid outcomes afterward.</div>
+              <div>3. Review win rates, ice output, safety violations, and shared-grid outcomes afterward.</div>
               <div>4. Open any stored run and replay it in the browser UI day by day.</div>
             </>
           ) : (
@@ -3796,7 +4670,7 @@ export default function App() {
                       Score {run.summary.score1.toFixed(0)} / {run.summary.score2.toFixed(0)} · Ice {run.summary.ice1.toFixed(0)} / {run.summary.ice2.toFixed(0)}
                     </div>
                     <div style={{ fontSize:6.5, color:"#3a5570" }}>
-                      Dip {run.summary.dip1.toFixed(0)} / {run.summary.dip2.toFixed(0)} · Extracted {(run.summary.extractedPct * 100).toFixed(1)}%
+                      Violations {run.summary.vio1.toFixed(0)} / {run.summary.vio2.toFixed(0)} · Extracted {(run.summary.extractedPct * 100).toFixed(1)}%
                     </div>
                     <button onClick={()=>watchReplayRun(run)} style={{
                       background:"rgba(255,255,255,0.04)", border:"1px solid rgba(255,255,255,0.08)",
@@ -4007,6 +4881,18 @@ export default function App() {
         ))}
 
         <div style={{ marginLeft:"auto", display:"flex", gap:3 }}>
+          <button onClick={()=>setShowPlots(true)} disabled={!p1 || batchRunning || replayLoading} title="Open analysis plots" style={{
+            background:"rgba(255,255,255,0.03)", border:"1px solid rgba(255,255,255,0.07)",
+            color: (!p1 || batchRunning || replayLoading) ? "#2a2f38" : "#7fd9ff", borderRadius:4, padding:"3px 7px",
+            cursor: (!p1 || batchRunning || replayLoading) ? "default" : "pointer",
+            fontSize:7, fontFamily:"'JetBrains Mono',monospace",
+          }}>📈 PLOTS</button>
+          <button onClick={exportMissionGif} disabled={!p1 || gifExporting || batchRunning || replayLoading} title="Export the visible mission timeline as an animated GIF" style={{
+            background:"rgba(255,255,255,0.03)", border:"1px solid rgba(255,255,255,0.07)",
+            color: (!p1 || gifExporting || batchRunning || replayLoading) ? "#2a2f38" : "#d4a85f", borderRadius:4, padding:"3px 7px",
+            cursor: (!p1 || gifExporting || batchRunning || replayLoading) ? "default" : "pointer",
+            fontSize:7, fontFamily:"'JetBrains Mono',monospace",
+          }}>⬇ GIF</button>
           <button onClick={exportMissionData} disabled={missionLog.length===0} title="Export event log as CSV" style={{
             background:"rgba(255,255,255,0.03)", border:"1px solid rgba(255,255,255,0.07)",
             color: missionLog.length>0?"#3a7a50":"#1a2a22", borderRadius:4, padding:"3px 7px",
@@ -4021,6 +4907,78 @@ export default function App() {
           }}>⬇ JSON</button>
         </div>
       </div>
+
+      {showPlots && (
+        <div style={{
+          width:"100%", maxWidth:980, marginBottom:10,
+          background:"rgba(3,7,18,0.98)", border:"1px solid rgba(255,255,255,0.08)",
+          borderRadius:10, padding:"14px 16px", boxShadow:"0 0 40px rgba(0,0,0,0.45)",
+        }}>
+          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:12 }}>
+            <div>
+              <div style={{ fontSize:8, letterSpacing:"0.28em", color:"#4f7c96", fontFamily:"'Orbitron',monospace" }}>MISSION PLOTS</div>
+              <div style={{ fontSize:7, color:"#35546a", marginTop:3 }}>
+                Timeline source: {replayRun ? "Replay frames" : "Live mission timeline"} · Each plot can be exported as PNG.
+              </div>
+            </div>
+            <div style={{ display:"flex", gap:6 }}>
+              <button onClick={exportAllPlots} style={{
+                background:"rgba(68,170,255,0.1)", border:"1px solid rgba(68,170,255,0.35)",
+                color:"#7fd9ff", borderRadius:6, padding:"7px 10px", cursor:"pointer",
+                fontSize:7, letterSpacing:"0.12em", fontFamily:"'JetBrains Mono',monospace",
+              }}>EXPORT ALL PNGS</button>
+              <button onClick={()=>setShowPlots(false)} style={{
+                background:"rgba(255,255,255,0.04)", border:"1px solid rgba(255,255,255,0.08)",
+                color:"#6b8aa1", borderRadius:6, padding:"7px 10px", cursor:"pointer",
+                fontSize:7, letterSpacing:"0.12em", fontFamily:"'JetBrains Mono',monospace",
+              }}>CLOSE</button>
+            </div>
+          </div>
+
+          <div style={{ display:"flex", flexDirection:"column", gap:14, maxHeight:"70vh", overflowY:"auto", paddingRight:4 }}>
+            {plotDefinitions.map(plot => (
+              <div key={plot.id} style={{ background:"rgba(255,255,255,0.02)", border:"1px solid rgba(255,255,255,0.05)", borderRadius:10, padding:"10px 10px 12px" }}>
+                <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:8 }}>
+                  <div style={{ fontSize:8, color:"#7ea8c2", letterSpacing:"0.12em", fontFamily:"'Orbitron',monospace" }}>{plot.title}</div>
+                  <div style={{ display:"flex", gap:6 }}>
+                    <button onClick={() => setSeparatePlotsOpen(prev => ({ ...prev, [plot.id]: !prev[plot.id] }))} style={{
+                      background:"rgba(255,255,255,0.04)", border:"1px solid rgba(255,255,255,0.08)",
+                      color:"#9bc4db", borderRadius:5, padding:"5px 8px", cursor:"pointer",
+                      fontSize:6.5, fontFamily:"'JetBrains Mono',monospace",
+                    }}>{separatePlotsOpen[plot.id] ? "HIDE SEPERATE PLOTS" : "SEPERATE PLOTS"}</button>
+                    <button onClick={() => downloadCanvasPng(plotCanvasRefs.current[plot.id], `${plot.id}.png`)} style={{
+                      background:"rgba(255,255,255,0.04)", border:"1px solid rgba(255,255,255,0.08)",
+                      color:"#9bc4db", borderRadius:5, padding:"5px 8px", cursor:"pointer",
+                      fontSize:6.5, fontFamily:"'JetBrains Mono',monospace",
+                    }}>EXPORT PNG</button>
+                  </div>
+                </div>
+                <PlotCanvas plot={plot} />
+                {separatePlotsOpen[plot.id] && (
+                  <div style={{ marginTop:10, display:"flex", flexDirection:"column", gap:10 }}>
+                    {plot.series.map((series, idx) => {
+                      const singlePlot = buildSeparatePlot(plot, series, idx);
+                      return (
+                        <div key={singlePlot.id} style={{ background:"rgba(255,255,255,0.02)", border:"1px solid rgba(255,255,255,0.05)", borderRadius:8, padding:"8px 8px 10px" }}>
+                          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:6 }}>
+                            <div style={{ fontSize:7, color:"#86acc4", letterSpacing:"0.08em", fontFamily:"'Orbitron',monospace" }}>{series.label}</div>
+                            <button onClick={() => downloadCanvasPng(plotCanvasRefs.current[singlePlot.id], `${singlePlot.id}.png`)} style={{
+                              background:"rgba(255,255,255,0.04)", border:"1px solid rgba(255,255,255,0.08)",
+                              color:"#9bc4db", borderRadius:5, padding:"4px 7px", cursor:"pointer",
+                              fontSize:6.5, fontFamily:"'JetBrains Mono',monospace",
+                            }}>EXPORT PNG</button>
+                          </div>
+                          <PlotCanvas plot={singlePlot} />
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Turn / phase prompt */}
       {(() => {
@@ -4076,13 +5034,13 @@ export default function App() {
       <div style={{ display:"flex", gap:5, width:"100%", maxWidth:650, marginBottom:5 }}>
         {[
           { label:"PLAYER 1", val:score1.toFixed(0), color:"#ffd700",
-            sub:`💧 ${totalIce1.toFixed(0)}kg · 🏗 ${p1?.assetPts??0}ap · 🤝 ${Math.round(p1?.diplomacy??0)}`,
+            sub:`💧 ${totalIce1.toFixed(0)}kg · 🏗 ${p1?.assetPts??0}ap · ⚠ ${p1?.safetyViolations??0}`,
             sub2:`${Math.round(p1?.budget??0)}cr · ${(share1*100).toFixed(0)}%` },
           { label:roundCounterLabel,
             val:`${depleted}/${CRATER_DATA.length}`, color:"#2a5070",
             sub:"craters depleted", sub2:"" },
           { label:"PLAYER 2", val:score2.toFixed(0), color:"#b000ff",
-            sub:`💧 ${totalIce2.toFixed(0)}kg · 🏗 ${p2?.assetPts??0}ap · 🤝 ${Math.round(p2?.diplomacy??0)}`,
+            sub:`💧 ${totalIce2.toFixed(0)}kg · 🏗 ${p2?.assetPts??0}ap · ⚠ ${p2?.safetyViolations??0}`,
             sub2:`${Math.round(p2?.budget??0)}cr · ${((1-share1)*100).toFixed(0)}%` },
         ].map(({label,val,color,sub,sub2}) => (
           <div key={label} style={{ flex:1, background:"rgba(4,9,22,0.98)",
@@ -4335,40 +5293,6 @@ export default function App() {
                         })}
                       </div>
                     )}
-                  </div>
-                );
-              })()}
-
-              {/* Diplomacy */}
-              {(() => {
-                const dip = p.diplomacy ?? 0;
-                // Thresholds divide the [-100, 100] range into clearer negative tiers.
-                //   [-100, -75)  Hated      deep red
-                //   [ -75, -45)  Terrible   red-orange
-                //   [ -45, -10)  Bad        orange
-                //   [ -10,  20]  Neutral    grey
-                //   (  20,  60]  Friendly   teal
-                //   (  60, 100]  Amicable   green
-                const dipLabel = dip < -75 ? "!! Hated"
-                               : dip < -45 ? "!! Terrible"
-                               : dip < -10 ? "!! Bad"
-                               : dip <=  20 ? "== Neutral"
-                               : dip <=  60 ? "~~ Friendly"
-                               :              "++ Amicable";
-                const dipCol = dip < -75 ? "#ff3344"
-                             : dip < -45 ? "#ff6644"
-                             : dip < -10 ? "#ffaa44"
-                             : dip <=  20 ? "#888899"
-                             : dip <=  60 ? "#44ccdd"
-                             :              "#44ddaa";
-                // Bar component is 0..max, so shift the -100..100 range into 0..200 for fill.
-                return (
-                  <div style={{ marginBottom:6 }}>
-                    <div style={{ display:"flex", justifyContent:"space-between", fontSize:7, color:"#2a4055", marginBottom:2 }}>
-                      <span>DIPL</span>
-                      <span style={{color:dipCol}}>{dipLabel} {Math.round(dip)}</span>
-                    </div>
-                    <Bar val={dip + 100} max={200} color={dipCol} h={3} />
                   </div>
                 );
               })()}
@@ -4645,7 +5569,7 @@ export default function App() {
                           fontSize:7, fontFamily:"inherit", letterSpacing:"0.05em", outline:"none", width:"100%",
                           opacity:isDone?0.35:1,
                         }}>
-                        <option value="">🤝 DIPLOMATIC DECISIONS</option>
+                        <option value="">⚡ GRID DECISIONS</option>
                         {dipOptions.map(o => (
                           <option key={o.type} value={o.type} style={{ background:"#040916", color:"#7aaac0" }}>
                             {o.label}
@@ -4666,7 +5590,7 @@ export default function App() {
                           cursor: sel && !isDone ? "pointer" : "not-allowed",
                           fontSize:7, fontFamily:"inherit", opacity:isDone?0.35:1, letterSpacing:"0.05em",
                         }}>
-                        {sel ? "TRANSMIT DECISION" : "SELECT A DIPLOMATIC ACTION"}
+                        {sel ? "TRANSMIT DECISION" : "SELECT A GRID ACTION"}
                       </button>
                     </div>
                   );
@@ -4868,7 +5792,7 @@ export default function App() {
                 <div style={{fontSize:8,color:"#2a3a4a",marginTop:6,lineHeight:1.8}}>
                   <div>💧 {p.iceDeposited.toFixed(0)} kg ice</div>
                   <div>🏗 {p.assetPts??0} asset pts</div>
-                  <div>🤝 {Math.round(p.diplomacy??0)} diplomacy</div>
+                  <div>⚠ {Math.round(p.safetyViolations??0)} safety violations</div>
                 </div>
               </div>
             )})}
@@ -4933,7 +5857,7 @@ export default function App() {
               const col = ev.type==="deposit"?"#44ff88"
                 : ev.type==="mine"?"#00d4ff"
                 : ev.type==="place"?"#ffaa44"
-                : ev.type==="diplomacy"?"#7ad8ff"
+                : ev.type==="grid"?"#7ad8ff"
                 : "#3a5570";
               return (
                 <div key={i} style={{ display:"flex", gap:8, fontSize:6.5,
@@ -5029,7 +5953,7 @@ export default function App() {
                   ["💰 Budget", `${Math.round(p1?.budget??0)} / ${Math.round(p2?.budget??0)} cr`],
                   ["📡 R&D Accum", `${Math.round(p1?.rdAccum??0)} / ${Math.round(p2?.rdAccum??0)}`],
                   ["⚔ Mil Score", `${(p1?.milScore??1).toFixed(2)} / ${(p2?.milScore??1).toFixed(2)}`],
-                  ["🤝 Diplomacy", `${Math.round(p1?.diplomacy??0)} / ${Math.round(p2?.diplomacy??0)}`],
+                  ["⚠ Safety Violations", `${Math.round(p1?.safetyViolations??0)} / ${Math.round(p2?.safetyViolations??0)}`],
                 ].map(([label, val]) => (
                   <div key={label} style={{ display:"flex", justifyContent:"space-between",
                     borderBottom:"1px solid rgba(255,255,255,0.03)", paddingBottom:1 }}>
@@ -5123,3 +6047,4 @@ export default function App() {
     </div>
   );
 }
+
