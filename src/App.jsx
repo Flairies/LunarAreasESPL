@@ -1691,6 +1691,7 @@ export default function App() {
         _habitatPower: erResult.habitatPower,
         _landingPads: erResult.landingPads,
         _structureHealth: erResult.structureHealth,
+        _pendingDeliveries: erResult.pendingDeliveries,
       };
     });
 
@@ -1723,10 +1724,22 @@ export default function App() {
         mergedResult = { ...mergedResult, landingPads: er._landingPads,
           structureHealth: { ...mergedResult.structureHealth, landingPads: er._structureHealth.landingPads } };
       }
+      // Remove items from pendingDeliveries that this extra rover picked up
+      if (er._pendingDeliveries && er._pendingDeliveries.length < s.pendingDeliveries.length) {
+        const pickedUpIds = new Set(
+          s.pendingDeliveries
+            .filter(d => !er._pendingDeliveries.some(pd => pd.id === d.id))
+            .map(d => d.id)
+        );
+        mergedResult = {
+          ...mergedResult,
+          pendingDeliveries: mergedResult.pendingDeliveries.filter(d => !pickedUpIds.has(d.id)),
+        };
+      }
     }
 
     // Strip internal merge fields from extraRovers
-    const cleanExtraRovers = newExtraRovers.map(({ _panels, _reactors, _habitats, _habitatPower, _landingPads, _structureHealth, events: _ev, ...clean }) => clean);
+    const cleanExtraRovers = newExtraRovers.map(({ _panels, _reactors, _habitats, _habitatPower, _landingPads, _structureHealth, _pendingDeliveries, events: _ev, ...clean }) => clean);
 
     const finalResult = { ...mergedResult, extraRovers: cleanExtraRovers, events: allEvents };
     return [{ ...finalResult, iceDeposited: s.iceDeposited + totalDep }, newHealth, allEvents];
