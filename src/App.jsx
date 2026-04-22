@@ -714,6 +714,8 @@ export default function App() {
   const mapRef    = useRef(null);
   const illumRef  = useRef(null);
   const liveTimelineKeyRef = useRef("");
+  const gifSavedSnapshotRef = useRef(null);
+  const saveFileInputRef = useRef(null);
   const plotCanvasRefs = useRef({});
   const [mapLoaded, setMapLoaded] = useState(false);
   const [illumLoaded, setIllumLoaded] = useState(false);
@@ -2486,6 +2488,51 @@ export default function App() {
     setAnnotations((snapshot.annotations || []).map(ann => ({ ...ann })));
   }
 
+  const exportSaveGame = () => {
+    const snapshot = captureUndoSnapshot();
+    const data = {
+      format: "psr-savegame-v1",
+      savedAt: new Date().toISOString(),
+      config: { simMode, totalRounds, missionEndMode, arrivalDelay, scenarioPreset,
+                gridSharingEnabled, gridSharingPermanent },
+      snapshot,
+    };
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `psr_save_R${round}D${globalDay + 1}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const importSaveGame = (file) => {
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const data = JSON.parse(e.target.result);
+        if (!data?.snapshot) { alert("Invalid save file: missing snapshot data."); return; }
+        const cfg = data.config || {};
+        if (cfg.simMode)               setSimMode(cfg.simMode);
+        if (cfg.totalRounds)           setTotalRounds(cfg.totalRounds);
+        if (cfg.missionEndMode)        setMissionEndMode(cfg.missionEndMode);
+        if (cfg.arrivalDelay != null)  setArrivalDelay(cfg.arrivalDelay);
+        if (cfg.scenarioPreset)        setScenarioPreset(cfg.scenarioPreset);
+        if (cfg.gridSharingEnabled != null) setGridSharingEnabled(cfg.gridSharingEnabled);
+        if (cfg.gridSharingPermanent != null) setGridSharingPermanent(cfg.gridSharingPermanent);
+        setUndoStack([]);
+        setReplayRun(null);
+        setReplayFrameIndex(0);
+        setReplayPlaying(false);
+        applyUndoSnapshot(data.snapshot);
+      } catch (err) {
+        alert(`Failed to load save file: ${err.message}`);
+      }
+    };
+    reader.readAsText(file);
+  };
+
   const recordUndoCheckpoint = () => {
     if (replayRun || batchRunning || phase === PHASE.SETTINGS || phase === PHASE.BATCH) return;
     const snapshot = captureUndoSnapshot();
@@ -3646,6 +3693,7 @@ export default function App() {
     if (gifExporting || !canvasRef.current || !p1) return;
     setGifExporting(true);
     const savedSnapshot = captureUndoSnapshot();
+    gifSavedSnapshotRef.current = savedSnapshot;
     const savedReplayRun = replayRun;
     const savedReplayFrameIndex = replayFrameIndex;
     const savedReplayPlaying = replayPlaying;
@@ -3664,10 +3712,30 @@ export default function App() {
         workerScript: gifWorkerUrl,
       });
 
+      // Phase 1: render each frame and compress to a PNG blob (~10x smaller than raw pixels).
+      // This keeps our own accumulation cheap while the browser can GC the composed canvases immediately.
+      const frameBlobs = [];
       for (const frame of framesToExport) {
         applyFrameSnapshot(frame, logSource);
         await waitForPaint(2);
-        gif.addFrame(composeGifFrame(frame), { copy: true, delay: GIF_FRAME_DELAY });
+        const composed = composeGifFrame(frame);
+        const blob = await new Promise(resolve => composed.toBlob(resolve, "image/png"));
+        frameBlobs.push(blob);
+      }
+
+      // Phase 2: decode blobs one at a time into a single reusable canvas and feed GIF.js.
+      // Only one decoded frame lives in memory at a time on our side.
+      const tempCanvas = document.createElement("canvas");
+      tempCanvas.width = W;
+      tempCanvas.height = H + GIF_OVERLAY_HEIGHT;
+      const tempCtx = tempCanvas.getContext("2d");
+      for (let i = 0; i < frameBlobs.length; i++) {
+        const bitmap = await createImageBitmap(frameBlobs[i]);
+        tempCtx.clearRect(0, 0, tempCanvas.width, tempCanvas.height);
+        tempCtx.drawImage(bitmap, 0, 0);
+        bitmap.close();
+        frameBlobs[i] = null; // release blob reference so GC can reclaim it
+        gif.addFrame(tempCanvas, { copy: true, delay: GIF_FRAME_DELAY });
       }
 
       const blob = await new Promise((resolve, reject) => {
@@ -4657,6 +4725,21 @@ export default function App() {
         }}>
           {simMode==="analysis" ? "RUN BATCH" : "DEPLOY MISSION"}
         </button>
+
+        <div style={{ marginTop:12, borderTop:"1px solid rgba(255,255,255,0.05)", paddingTop:12 }}>
+          <input ref={saveFileInputRef} type="file" accept=".json" style={{ display:"none" }}
+            onChange={e => { importSaveGame(e.target.files?.[0]); e.target.value = ""; }} />
+          <button onClick={() => saveFileInputRef.current?.click()} style={{
+            width:"100%", background:"rgba(100,160,255,0.06)",
+            border:"1px solid rgba(100,160,255,0.2)",
+            color:"#5a9fd4", borderRadius:7, padding:"10px 0", cursor:"pointer",
+            fontSize:9, letterSpacing:"0.25em", fontFamily:"'Orbitron','Courier New',monospace",
+            fontWeight:700,
+          }}>⬆ LOAD SAVED GAME</button>
+          <div style={{ fontSize:6, color:"#1e3a50", textAlign:"center", marginTop:5, letterSpacing:"0.08em" }}>
+            Load a .json save file exported during a previous session
+          </div>
+        </div>
       </div>
     </div>
   );
@@ -4999,12 +5082,29 @@ export default function App() {
             cursor: (!p1 || batchRunning || replayLoading) ? "default" : "pointer",
             fontSize:7, fontFamily:"'JetBrains Mono',monospace",
           }}>📈 PLOTS</button>
+          <button onClick={exportSaveGame} disabled={!p1 || gifExporting} title="Save full game state to a .json file you can reload later" style={{
+            background:"rgba(255,255,255,0.03)", border:"1px solid rgba(255,255,255,0.07)",
+            color: (!p1 || gifExporting) ? "#2a2f38" : "#5ab4d4", borderRadius:4, padding:"3px 7px",
+            cursor: (!p1 || gifExporting) ? "default" : "pointer",
+            fontSize:7, fontFamily:"'JetBrains Mono',monospace",
+          }}>💾 SAVE</button>
           <button onClick={exportMissionGif} disabled={!p1 || gifExporting || batchRunning || replayLoading} title="Export the visible mission timeline as an animated GIF" style={{
             background:"rgba(255,255,255,0.03)", border:"1px solid rgba(255,255,255,0.07)",
             color: (!p1 || gifExporting || batchRunning || replayLoading) ? "#2a2f38" : "#d4a85f", borderRadius:4, padding:"3px 7px",
             cursor: (!p1 || gifExporting || batchRunning || replayLoading) ? "default" : "pointer",
             fontSize:7, fontFamily:"'JetBrains Mono',monospace",
           }}>⬇ GIF</button>
+          {gifExporting && (
+            <button onClick={() => {
+              if (gifSavedSnapshotRef.current) applyUndoSnapshot(gifSavedSnapshotRef.current);
+              gifSavedSnapshotRef.current = null;
+              setGifExporting(false);
+            }} title="Cancel GIF export and restore game state" style={{
+              background:"rgba(255,80,80,0.12)", border:"1px solid rgba(255,80,80,0.35)",
+              color:"#ff6060", borderRadius:4, padding:"3px 7px", cursor:"pointer",
+              fontSize:7, fontFamily:"'JetBrains Mono',monospace",
+            }}>✕ CANCEL GIF</button>
+          )}
           <button onClick={exportMissionData} disabled={missionLog.length===0} title="Export event log as CSV" style={{
             background:"rgba(255,255,255,0.03)", border:"1px solid rgba(255,255,255,0.07)",
             color: missionLog.length>0?"#3a7a50":"#1a2a22", borderRadius:4, padding:"3px 7px",
