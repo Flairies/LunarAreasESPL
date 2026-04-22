@@ -1789,14 +1789,15 @@ export default function App() {
     }
 
     // ── Safety zone decay ──────────────────────────────────────────────────
-    const applyDecay = (owner, enemyPos, attackMil, defenseMil) => {
+    const applyDecay = (owner, enemyPositions, attackMil, defenseMil) => {
       const sh = { ...owner.structureHealth };
       const structTypes = [
-        { key: 'panels',      list: owner.panels,             type: 'solar'   },
-        { key: 'reactors',    list: owner.reactors||[],       type: 'reactor' },
-        { key: 'habitats',    list: owner.habitats||[],       type: 'habitat' },
-        { key: 'extraRovers', list: owner.extraRovers||[],   type: 'rover'   },
-        { key: 'landingPads', list: owner.landingPads||[],   type: 'pad'     },
+        { key: 'panels',        list: owner.panels,                              type: 'solar'   },
+        { key: 'reactors',      list: owner.reactors||[],                        type: 'reactor' },
+        { key: 'habitats',      list: owner.habitats||[],                        type: 'habitat' },
+        { key: 'primaryRover',  list: [{ x: owner.x, y: owner.y }],             type: 'rover'   },
+        { key: 'extraRovers',   list: owner.extraRovers||[],                     type: 'rover'   },
+        { key: 'landingPads',   list: owner.landingPads||[],                     type: 'pad'     },
       ];
       const newSH = {};
       let damageDone = 0;
@@ -1811,7 +1812,7 @@ export default function App() {
           const struct = list[idx];
           const radius = SAFETY_RADIUS[type];
           const generatorSharedSafe = sharedGridActive && (type === "solar" || type === "reactor");
-          const inZone = !generatorSharedSafe && d2(enemyPos, struct) < radius;
+          const inZone = !generatorSharedSafe && enemyPositions.some(ep => d2(ep, struct) < radius);
           const decay = inZone ? hostileDecayEff : _PASSIVE_DECAY;
           if (inZone) {
             damageDone += hostileDecayEff;
@@ -1833,11 +1834,13 @@ export default function App() {
 
     const mil1 = np1.milScore ?? 1.0;
     const mil2 = np2?.milScore ?? 1.0;
+    const p2AllRovers = p2 ? [{ x: np2.x, y: np2.y }, ...(np2.extraRovers || [])] : [];
+    const p1AllRovers = [{ x: np1.x, y: np1.y }, ...(np1.extraRovers || [])];
     const { updatedOwner: dnp1, damageDone: dmgByP2 } = p2
-      ? applyDecay(np1, { x: np2.x, y: np2.y }, mil2, mil1)
+      ? applyDecay(np1, p2AllRovers, mil2, mil1)
       : { updatedOwner: np1, damageDone: 0 };
     const { updatedOwner: dnp2, damageDone: dmgByP1 } = p2
-      ? applyDecay(np2, { x: np1.x, y: np1.y }, mil1, mil2)
+      ? applyDecay(np2, p1AllRovers, mil1, mil2)
       : { updatedOwner: np2, damageDone: 0 };
     const fnp1base = dnp1;
     const fnp2base = dnp2;
@@ -2336,6 +2339,7 @@ export default function App() {
         panels: [...(player.structureHealth?.panels || [])],
         reactors: [...(player.structureHealth?.reactors || [])],
         habitats: [...(player.structureHealth?.habitats || [])],
+        primaryRover: [...(player.structureHealth?.primaryRover || [1.0])],
         extraRovers: [...(player.structureHealth?.extraRovers || [])],
         landingPads: [...(player.structureHealth?.landingPads || [])],
       },
@@ -2491,11 +2495,12 @@ export default function App() {
   const exportSaveGame = () => {
     const snapshot = captureUndoSnapshot();
     const data = {
-      format: "psr-savegame-v1",
+      format: "psr-savegame-v2",
       savedAt: new Date().toISOString(),
       config: { simMode, totalRounds, missionEndMode, arrivalDelay, scenarioPreset,
                 gridSharingEnabled, gridSharingPermanent },
       snapshot,
+      liveTimeline: liveTimeline.map(({ __key, ...frame }) => frame),
     };
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
@@ -2525,6 +2530,10 @@ export default function App() {
         setReplayRun(null);
         setReplayFrameIndex(0);
         setReplayPlaying(false);
+        if (Array.isArray(data.liveTimeline) && data.liveTimeline.length > 0) {
+          setLiveTimeline(data.liveTimeline);
+          liveTimelineKeyRef.current = "";
+        }
         applyUndoSnapshot(data.snapshot);
       } catch (err) {
         alert(`Failed to load save file: ${err.message}`);
